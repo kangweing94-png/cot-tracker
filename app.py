@@ -28,9 +28,9 @@ with st.sidebar:
     st.caption("数据源:\n- CFTC\n- TradingEconomics\n- MacroMicro 本地 CSV\n- FRED + 本地备份")
 
 
-# ==============================================================================
-# 模块 1: CFTC 核心逻辑（和你之前的一样）
-# ==============================================================================
+# ======================================================================
+# 模块 1: CFTC 核心逻辑
+# ======================================================================
 @st.cache_data(ttl=3600 * 3)
 def get_cftc_data():
     year = datetime.datetime.now().year
@@ -112,14 +112,14 @@ def process_cftc(df, name_keywords):
     return data.tail(52)
 
 
-# ==============================================================================
+# ======================================================================
 # 模块 2: 多数据源宏观引擎
 # TradingEconomics + MacroMicro (CSV) + FRED(带本地备份)
-# ==============================================================================
+# ======================================================================
 
 def _fetch_tradingeconomics(country: str, indicator: str):
     """TradingEconomics: 按国家 + 指标 获取历史数据"""
-    if not TE_API_KEY or TE_API_KEY == "your_tradingeconomics_key_here":
+    if not TE_API_KEY or TE_API_KEY == "a7d624f316a049e:nmasw3jt5rkbeoi":
         return None
 
     url = f"https://api.tradingeconomics.com/historical/country/{country}/indicator/{indicator}"
@@ -218,7 +218,6 @@ def get_macro_multi():
     sources = {}
 
     # ===== Fed Funds 利率 =====
-    # 优先 TradingEconomics (美国 Interest Rate)，再 FRED(FEDFUNDS)
     te_rate = _fetch_tradingeconomics("united states", "interest rate")
     fred_rate_df, fred_rate_src = _fetch_fred_with_backup("FEDFUNDS", "fedfunds.csv")
 
@@ -232,9 +231,6 @@ def get_macro_multi():
         sources["fed_funds"] = "无数据"
 
     # ===== CPI YoY =====
-    # 1) TradingEconomics: Inflation Rate (就是 YoY)
-    # 2) MacroMicro 本地 CSV: mm_us_cpi_yoy.csv
-    # 3) FRED: CPIAUCSL 自己算 YoY
     te_cpi = _fetch_tradingeconomics("united states", "inflation rate")
     mm_cpi = _fetch_macromicro_local("mm_us_cpi_yoy.csv")
 
@@ -257,9 +253,6 @@ def get_macro_multi():
         sources["cpi_yoy"] = "无数据"
 
     # ===== NFP Change =====
-    # 1) TradingEconomics: Non Farm Payrolls
-    # 2) MacroMicro: mm_us_nfp_change.csv
-    # 3) FRED: PAYEMS.diff()
     te_nfp = _fetch_tradingeconomics("united states", "non farm payrolls")
     mm_nfp = _fetch_macromicro_local("mm_us_nfp_change.csv")
 
@@ -282,9 +275,6 @@ def get_macro_multi():
         sources["nfp_change"] = "无数据"
 
     # ===== Jobless Claims =====
-    # 1) TradingEconomics: Jobless Claims
-    # 2) MacroMicro CSV
-    # 3) FRED: ICSA
     te_claims = _fetch_tradingeconomics("united states", "jobless claims")
     mm_claims = _fetch_macromicro_local("mm_us_jobless_claims.csv")
     fred_claims_df, fred_claims_src = _fetch_fred_with_backup("ICSA", "claims.csv")
@@ -300,24 +290,32 @@ def get_macro_multi():
     else:
         sources["jobless_claims"] = "无数据"
 
-    # 组装统一 DataFrame
-    macro_df = pd.DataFrame(
-        {
-            "fed_funds": fed_funds_series,
-            "cpi_yoy": cpi_series,
-            "nfp_change": nfp_series,
-            "jobless_claims": claims_series,
-        }
-    )
+    # ========= 关键修正：只合并有数据的 series =========
+    series_map = {
+        "fed_funds": fed_funds_series,
+        "cpi_yoy": cpi_series,
+        "nfp_change": nfp_series,
+        "jobless_claims": claims_series,
+    }
 
+    # 过滤掉为 None 的
+    non_null_series = {k: v for k, v in series_map.items() if v is not None}
+
+    # 如果全部都没有数据，直接返回空 df，避免 ValueError
+    if not non_null_series:
+        return pd.DataFrame(), sources
+
+    # 用 concat 对齐 index，比直接 DataFrame 构造更安全
+    macro_df = pd.concat(non_null_series.values(), axis=1)
+    macro_df.columns = list(non_null_series.keys())
     macro_df.sort_index(inplace=True)
 
     return macro_df, sources
 
 
-# ==============================================================================
+# ======================================================================
 # UI 组件
-# ==============================================================================
+# ======================================================================
 def render_news_alert(last_date_obj):
     if pd.isnull(last_date_obj):
         return
@@ -361,9 +359,9 @@ def render_fomc_card():
         )
 
 
-# ==============================================================================
+# ======================================================================
 # 主程序
-# ==============================================================================
+# ======================================================================
 with st.spinner("正在同步华尔街数据..."):
     cftc_df = get_cftc_data()
     gold_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
@@ -379,6 +377,7 @@ if not gold_data.empty:
     render_news_alert(last_val["Date_Display"])
 
 tab1, tab2 = st.tabs(["📊 COT 机构持仓", "🌍 宏观经济 (Multi-Source)"])
+
 
 # ---------- Tab1: COT ----------
 with tab1:
@@ -410,6 +409,7 @@ with tab1:
     with c2:
         simple_chart(euro_data, "Euro (EUR)", "#00d2ff")
 
+
 # ---------- Tab2: 宏观 ----------
 with tab2:
     render_fomc_card()
@@ -421,7 +421,7 @@ with tab2:
         m1, m2, m3, m4 = st.columns(4)
 
         # Fed Rate
-        if pd.notna(latest.get("fed_funds", None)):
+        if "fed_funds" in macro_df.columns and pd.notna(latest.get("fed_funds", None)):
             m1.metric(
                 "🇺🇸 Fed Funds Rate",
                 f"{latest['fed_funds']:.2f}%",
@@ -431,7 +431,7 @@ with tab2:
             m1.write("Fed Funds: 无数据")
 
         # CPI YoY
-        if pd.notna(latest.get("cpi_yoy", None)):
+        if "cpi_yoy" in macro_df.columns and pd.notna(latest.get("cpi_yoy", None)):
             m2.metric(
                 "🔥 CPI (YoY)",
                 f"{latest['cpi_yoy']:.1f}%",
@@ -441,7 +441,7 @@ with tab2:
             m2.write("CPI YoY: 无数据")
 
         # NFP Change
-        if pd.notna(latest.get("nfp_change", None)):
+        if "nfp_change" in macro_df.columns and pd.notna(latest.get("nfp_change", None)):
             m3.metric(
                 "👷 NFP Change",
                 f"{int(latest['nfp_change']):,}",
@@ -451,7 +451,9 @@ with tab2:
             m3.write("NFP Change: 无数据")
 
         # Jobless Claims
-        if pd.notna(latest.get("jobless_claims", None)):
+        if "jobless_claims" in macro_df.columns and pd.notna(
+            latest.get("jobless_claims", None)
+        ):
             m4.metric(
                 "🤕 Jobless Claims",
                 f"{int(latest['jobless_claims']):,}",
@@ -469,20 +471,23 @@ with tab2:
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("通胀趋势 (CPI YoY)")
-            if macro_df["cpi_yoy"].notna().sum() > 0:
+            if "cpi_yoy" in macro_df.columns and macro_df["cpi_yoy"].notna().sum() > 0:
                 st.line_chart(macro_df["cpi_yoy"].tail(36))
             else:
                 st.info("暂无 CPI YoY 数据")
 
         with c2:
             st.subheader("就业市场 (NFP Change)")
-            if macro_df["nfp_change"].notna().sum() > 0:
+            if "nfp_change" in macro_df.columns and macro_df["nfp_change"].notna().sum() > 0:
                 st.bar_chart(macro_df["nfp_change"].tail(36))
             else:
                 st.info("暂无 NFP Change 数据")
 
         st.subheader("初请失业金 (Jobless Claims)")
-        if macro_df["jobless_claims"].notna().sum() > 0:
+        if (
+            "jobless_claims" in macro_df.columns
+            and macro_df["jobless_claims"].notna().sum() > 0
+        ):
             st.line_chart(macro_df["jobless_claims"].tail(36))
         else:
             st.info("暂无 Jobless Claims 数据")
