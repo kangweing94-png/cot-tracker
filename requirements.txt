@@ -2,3 +2,4 @@ streamlit
 pandas
 plotly
 cot_reports
+pytz
