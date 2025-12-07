@@ -1,5 +1,6 @@
 streamlit
 pandas
 plotly
-pytz
 requests
+pandas_datareader
+pytz
