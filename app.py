@@ -15,7 +15,7 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ========= API KEYS =========
-TE_API_KEY = "a7d624f316a049e:nmasw3jt5rkbeoi"          # TradingEconomics：只做状态
+TE_API_KEY = "a7d624f316a049e:nmasw3jt5rkbeoi"          # TradingEconomics：只做状态诊断
 FRED_API_KEY = "476ef255e486edb3fdbf71115caa2857"      # FRED 官方 API：主宏观数据
 
 
@@ -86,11 +86,10 @@ def find_column(columns, keywords):
 
 def process_cftc(df, name_keywords):
     """
-    筛选芝商所主力合约 + 计算 Managed Money 净持仓
-    name_keywords 里放的是一组「必须全部包含的关键字」，比如：
-      - GOLD: ["GOLD", "COMMODITY"]
-      - EUR:  ["EURO FX", "CHICAGO MERCANTILE"]
-      - GBP:  ["BRITISH POUND STERLING", "CHICAGO MERCANTILE"]
+    回复到你之前“有数据”的版本逻辑：
+      - 按合约名称做 **OR 匹配**（只要名称包含任一关键字即可）
+      - 计算 Managed Money 多空净值
+      - 保留最近 156 条（约 3 年周数据）
     """
     if df.empty:
         return pd.DataFrame()
@@ -104,7 +103,7 @@ def process_cftc(df, name_keywords):
 
     def _match_name(x):
         s = str(x).upper()
-        return all(k.upper() in s for k in name_keywords)
+        return any(k.upper() in s for k in name_keywords)
 
     mask = df[name_col].apply(_match_name)
     data = df[mask].copy()
@@ -139,10 +138,11 @@ def process_cftc(df, name_keywords):
 # 模块 2: FRED 宏观数据（官方 API）+ TE 状态诊断
 # ======================================================================
 
-def _fred_api_series(series_id: str, start="1990-01-01"):
+def _fred_api_series(series_id: str):
     """
     调用 FRED 官方 API，返回 (series, status_text)
-    注意：不再传 frequency，避免 400。
+    最简参数：series_id + api_key + file_type
+    避免乱加 frequency/observation_start 造成 400。
     """
     if not FRED_API_KEY:
         return None, "FRED: 无 API Key"
@@ -152,8 +152,6 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
         "series_id": series_id,
         "api_key": FRED_API_KEY,
         "file_type": "json",
-        "observation_start": start,
-        "observation_end": "9999-12-31",
     }
 
     try:
@@ -178,7 +176,6 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
                 if math.isnan(val):
                     continue
             except ValueError:
-                # '.' 等缺失值
                 continue
             dates.append(d)
             values.append(val)
@@ -190,7 +187,7 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
         df.set_index("DATE", inplace=True)
         df.sort_index(inplace=True)
 
-        # 简单备份一份
+        # 备份一份
         backup_name = f"{series_id}.csv"
         df.to_csv(os.path.join(DATA_DIR, backup_name))
 
@@ -226,18 +223,18 @@ def _te_status_only(country: str, indicator: str):
 @st.cache_data(ttl=3600 * 3)
 def get_macro_from_fred():
     """
-    真正画图/算指标用 FRED API。
+    画图 / 指标全部用 FRED API。
     TE 只做状态记录。
     """
     sources = {}
 
     # Fed Funds
-    fed, fed_info = _fred_api_series("FEDFUNDS", start="1980-01-01")
+    fed, fed_info = _fred_api_series("FEDFUNDS")
     te_fed = _te_status_only("united states", "interest rate")
     sources["fed_funds"] = f"{fed_info} | {te_fed}"
 
     # CPI YoY
-    cpi_raw, cpi_info = _fred_api_series("CPIAUCSL", start="1980-01-01")
+    cpi_raw, cpi_info = _fred_api_series("CPIAUCSL")
     if cpi_raw is not None:
         cpi_yoy = cpi_raw.pct_change(12) * 100
     else:
@@ -246,7 +243,7 @@ def get_macro_from_fred():
     sources["cpi_yoy"] = f"{cpi_info} | {te_cpi}"
 
     # NFP Change
-    nfp_raw, nfp_info = _fred_api_series("PAYEMS", start="1980-01-01")
+    nfp_raw, nfp_info = _fred_api_series("PAYEMS")
     if nfp_raw is not None:
         nfp_change = nfp_raw.diff()
     else:
@@ -255,7 +252,7 @@ def get_macro_from_fred():
     sources["nfp_change"] = f"{nfp_info} | {te_nfp}"
 
     # Jobless Claims
-    claims_raw, claims_info = _fred_api_series("ICSA", start="1980-01-01")
+    claims_raw, claims_info = _fred_api_series("ICSA")
     te_claims = _te_status_only("united states", "jobless claims")
     sources["jobless_claims"] = f"{claims_info} | {te_claims}"
 
@@ -345,18 +342,18 @@ def cot_chart(data, title, color):
 # 主程序
 # ======================================================================
 with st.spinner("正在同步 COT & 宏观数据…"):
-    # CFTC
+    # CFTC：用宽松 OR 匹配
     cftc_df = get_cftc_data()
+    eur_data = process_cftc(cftc_df, ["EURO FX"])
+    gbp_data = process_cftc(cftc_df, ["BRITISH POUND"])
     xau_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
-    eur_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO MERCANTILE"])
-    gbp_data = process_cftc(cftc_df, ["BRITISH POUND STERLING", "CHICAGO MERCANTILE"])
 
     # 宏观：FRED API 为主，TE 只做状态
     macro_df, macro_sources = get_macro_from_fred()
 
 st.title("Smart Money & Macro Dashboard")
 
-# CFTC 顶部警报
+# CFTC 顶部警报（用黄金的最后日期做参考）
 if not xau_data.empty:
     render_cftc_alert(xau_data.iloc[-1]["Date_Display"])
 
@@ -374,6 +371,7 @@ with tab1:
         st.subheader("British Pound (GBP) 期货 - Managed Money 净持仓")
         cot_chart(gbp_data, "British Pound (GBP)", "#ff7f0e")
 
+    # 下排：XAU
     st.subheader("Gold (XAU) 期货 - Managed Money 净持仓")
     cot_chart(xau_data, "Gold (XAU)", "#FFD700")
 
