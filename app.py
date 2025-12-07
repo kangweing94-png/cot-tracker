@@ -18,18 +18,15 @@ with st.sidebar:
         st.rerun()
     
     st.divider()
-    st.caption("数据源:\n1. CFTC (持仓)\n2. FRED (宏观经济)\n3. Federal Reserve (利率)")
-    
-    # 增加调试信息
-    st.caption(f"Python Env: Streamlit Cloud")
+    st.caption("数据源:\n1. CFTC (持仓)\n2. FRED (宏观经济)")
 
 # ==============================================================================
-# 模块 1: CFTC 持仓数据 (自动抓取 + 拼合)
+# 模块 1: CFTC 核心逻辑 (回滚到最稳定的版本)
 # ==============================================================================
 @st.cache_data(ttl=3600*3)
 def get_cftc_data():
     year = datetime.datetime.now().year
-    
+    # 模拟用户提到的"2025年政府停摆"场景
     url_history = f"https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
     url_latest = "https://www.cftc.gov/dea/newcot/f_disagg.txt"
     
@@ -38,79 +35,97 @@ def get_cftc_data():
     df_hist = pd.DataFrame()
     df_live = pd.DataFrame()
 
+    # 1. 下载历史包
     try:
         r = requests.get(url_history, headers=headers, verify=False, timeout=10)
         if r.status_code == 200:
             df_hist = pd.read_csv(io.BytesIO(r.content), compression='zip', low_memory=False)
     except: pass
 
+    # 2. 下载本周实时包
     try:
         r2 = requests.get(f"{url_latest}?t={int(time.time())}", headers=headers, verify=False, timeout=5)
         if r2.status_code == 200:
             if not df_hist.empty:
                 df_live = pd.read_csv(io.BytesIO(r2.content), header=None, low_memory=False)
-                df_live.columns = df_hist.columns
-            else:
-                # 如果历史下载失败，尝试盲猜列名以防报错（虽然很少见）
-                pass 
+                df_live.columns = df_hist.columns # 强行对齐列名
     except: pass
 
     if df_hist.empty and df_live.empty: return pd.DataFrame()
-    
-    # 强力拼合
     return pd.concat([df_hist, df_live], ignore_index=True)
 
-def process_cftc(df, keywords):
+# 🔥 关键修复：恢复了 helper 函数，不再使用简化的列表推导
+def find_column(columns, keywords):
+    for col in columns:
+        col_lower = str(col).lower()
+        if all(k in col_lower for k in keywords):
+            return col
+    return None
+
+def process_cftc(df, name_keywords):
     if df.empty: return pd.DataFrame()
-    try:
-        # 模糊搜索列名
-        cols = df.columns
-        name_col = next((c for c in cols if 'Market' in str(c) or 'Contract' in str(c)), None)
-        date_col = next((c for c in cols if 'Date' in str(c) or 'Report' in str(c)), None)
-        long_col = next((c for c in cols if 'Money' in str(c) and 'Long' in str(c)), None)
-        short_col = next((c for c in cols if 'Money' in str(c) and 'Short' in str(c)), None)
-        
-        if not all([name_col, date_col, long_col, short_col]): return pd.DataFrame()
-        
-        mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in keywords))
-        data = df[mask].copy()
-        
-        data[date_col] = pd.to_datetime(data[date_col])
-        data['Net'] = data[long_col] - data[short_col]
-        data = data.sort_values(date_col).drop_duplicates(subset=[date_col], keep='last')
-        return data.tail(52)
-    except: return pd.DataFrame()
+
+    # 1. 找名字 (Name/Market)
+    name_col = find_column(df.columns, ['market', 'exchange']) or \
+               find_column(df.columns, ['contract', 'name'])
+    if not name_col: return pd.DataFrame()
+
+    # 2. 筛选 (Gold/Euro)
+    mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in name_keywords))
+    data = df[mask].copy()
+    if data.empty: return pd.DataFrame()
+
+    # 3. 找日期 (Date)
+    date_col = find_column(df.columns, ['report', 'date']) or \
+               find_column(df.columns, ['as', 'of', 'date'])
+    data[date_col] = pd.to_datetime(data[date_col])
+    
+    # 4. 找 Managed Money (Smart Money)
+    long_col = find_column(df.columns, ['money', 'long'])
+    short_col = find_column(df.columns, ['money', 'short'])
+    
+    if not long_col or not short_col: return pd.DataFrame()
+    
+    # 5. 计算净持仓
+    data['Net'] = data[long_col] - data[short_col]
+    data['Date_Display'] = data[date_col]
+    
+    # 6. 去重
+    data = data.sort_values('Date_Display')
+    data = data.drop_duplicates(subset=['Date_Display'], keep='last')
+    
+    return data.tail(52)
 
 # ==============================================================================
-# 模块 2: 宏观经济数据 (直接读取 FRED CSV，无需第三方库)
+# 模块 2: 宏观经济数据 (纯 CSV 读取版，稳定)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def get_macro_data():
-    # FRED 官方 CSV 接口：https://fred.stlouisfed.org/graph/fredgraph.csv?id=SERIES_ID
     base_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
     
     def fetch_fred(series_id):
         try:
-            df = pd.read_csv(f"{base_url}{series_id}")
-            df['DATE'] = pd.to_datetime(df['DATE'])
-            df.set_index('DATE', inplace=True)
-            return df
-        except Exception as e:
-            print(f"Error fetching {series_id}: {e}")
-            return None
+            # 增加 User-Agent 防止被拒
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(f"{base_url}{series_id}", headers=headers, timeout=5)
+            if r.status_code == 200:
+                df = pd.read_csv(io.BytesIO(r.content))
+                df['DATE'] = pd.to_datetime(df['DATE'])
+                df.set_index('DATE', inplace=True)
+                return df
+        except: return None
+        return None
 
     # 1. 联邦基金利率
     fed_rate = fetch_fred('FEDFUNDS')
     
-    # 2. 非农就业 (Payrolls)
+    # 2. 非农就业
     nfp = fetch_fred('PAYEMS')
-    if nfp is not None:
-        nfp['Change'] = nfp['PAYEMS'].diff() # 计算新增人数
+    if nfp is not None: nfp['Change'] = nfp['PAYEMS'].diff()
     
     # 3. CPI 通胀
     cpi = fetch_fred('CPIAUCSL')
-    if cpi is not None:
-        cpi['YoY'] = cpi['CPIAUCSL'].pct_change(12) * 100 # 计算年率
+    if cpi is not None: cpi['YoY'] = cpi['CPIAUCSL'].pct_change(12) * 100
         
     # 4. 初请失业金
     claims = fetch_fred('ICSA')
@@ -118,7 +133,7 @@ def get_macro_data():
     return fed_rate, nfp, cpi, claims
 
 # ==============================================================================
-# 模块 3: UI 渲染组件
+# UI 组件
 # ==============================================================================
 def render_news_alert(last_date_obj):
     if pd.isnull(last_date_obj): return
@@ -130,11 +145,14 @@ def render_news_alert(last_date_obj):
             st.markdown(f"""
             #### 🏛️ 美国政府停摆导致 CFTC 报告积压
             **事件影响**: 由于美国政府在 **2025年10月** 期间发生停摆 (Government Shutdown)，CFTC 暂停了所有数据处理。
+            
             **当前状态**: 正在按顺序补发历史报告，预计 2026年1月 恢复正常。
+            
+            *此数据最后更新于: {last_date_obj.strftime('%Y-%m-%d')}*
             """)
 
 def render_fomc_card():
-    # 模拟 2025/2026 关键日期
+    # 简单的 FOMC 下次会议倒计时逻辑
     fomc_dates = [datetime.date(2025, 12, 10), datetime.date(2026, 1, 28), datetime.date(2026, 3, 18)]
     today = datetime.date.today()
     next_meet = next((d for d in fomc_dates if d >= today), None)
@@ -156,20 +174,19 @@ def render_fomc_card():
 
 with st.spinner('正在同步华尔街数据...'):
     cftc_df = get_cftc_data()
+    # 恢复了你最满意的黄金数据处理逻辑
     gold_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
     euro_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO"])
     
-    # 获取宏观数据
+    # 宏观数据
     fed, nfp, cpi, claims = get_macro_data()
 
 st.title("Smart Money & Macro Dashboard")
 
-# 警报检测
+# 顶部：新闻警报 (基于黄金数据的日期)
 if not gold_data.empty:
-    # 兼容性处理：获取最后一行的日期
-    date_col = next((c for c in gold_data.columns if 'Date' in str(c)), None)
-    if date_col:
-        render_news_alert(gold_data.iloc[-1][date_col])
+    last_val = gold_data.iloc[-1]
+    render_news_alert(last_val['Date_Display'])
 
 # 选项卡
 tab1, tab2 = st.tabs(["📊 COT 机构持仓", "🌍 宏观经济 (Macro)"])
@@ -179,10 +196,17 @@ with tab1:
         if data.empty: 
             st.warning(f"{name}: 暂无数据")
             return
-        date_c = next((c for c in data.columns if 'Date' in str(c)), None)
+        
+        last_date = data['Date_Display'].iloc[-1].strftime('%Y-%m-%d')
+        net_pos = int(data['Net'].iloc[-1])
+        
+        # 指标卡
+        st.metric(f"{name} Managed Money", f"{net_pos:,}", f"Report: {last_date}")
+        
+        # 图表
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data[date_c], y=data['Net'], fill='tozeroy', line=dict(color=color), name='Net Pos'))
-        fig.update_layout(title=f"{name} Managed Money Net", height=350, margin=dict(t=40,b=0,l=0,r=0))
+        fig.add_trace(go.Scatter(x=data['Date_Display'], y=data['Net'], fill='tozeroy', line=dict(color=color), name='Net Pos'))
+        fig.update_layout(height=350, margin=dict(t=10,b=0,l=0,r=0))
         st.plotly_chart(fig, use_container_width=True)
 
     c1, c2 = st.columns(2)
