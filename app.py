@@ -1,196 +1,243 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import cot_reports as cot
 import datetime
-import pytz # 用于处理时区
+import requests
+import io
+import time
+import random
+import pytz
+import pandas_datareader.data as web # 新增：宏观数据神器
 
-# --- 页面设置 ---
-st.set_page_config(page_title="COT Pro Dashboard", page_icon="📊", layout="wide")
+# --- 页面配置 ---
+st.set_page_config(page_title="Smart Money & Macro Pro", page_icon="🏦", layout="wide")
 
-# --- 侧边栏：发布时间与控制台 ---
+# --- 侧边栏 ---
 with st.sidebar:
-    st.header("📅 CFTC 发布时间表")
-    
-    # 1. 计算下次发布时间
-    tz_et = pytz.timezone('US/Eastern')
-    tz_my = pytz.timezone('Asia/Kuala_Lumpur')
-    
-    now_et = datetime.datetime.now(tz_et)
-    # 找到本周五
-    friday = now_et + datetime.timedelta((4 - now_et.weekday()) % 7)
-    release_time = friday.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    # 如果现在已经过了周五发布时间，就显示下周五
-    if now_et > release_time:
-        release_time += datetime.timedelta(days=7)
-    
-    release_my = release_time.astimezone(tz_my)
-    
-    st.info(f"""
-    **下一次数据更新:**
-    
-    🇺🇸 美东: {release_time.strftime('%A, %b %d %H:%M')}
-    🇲🇾 大马: {release_my.strftime('%A, %b %d %H:%M')}
-    
-    *(数据通常滞后3天，反映的是周二的持仓)*
-    """)
-    
-    st.divider()
-    
-    st.write("🔧 **系统控制**")
-    if st.button("🔄 强制刷新数据 (Clear Cache)"):
+    st.header("⚡ 控制台")
+    if st.button("🔄 刷新全站数据"):
         st.cache_data.clear()
         st.rerun()
-
-    # --- 🔥 新增：数据来源引用 (Data Source) ---
-    st.divider()
-    st.markdown("### 📚 Data Reference")
-    st.markdown("""
-    此应用数据直接源自美国商品期货交易委员会 (CFTC)。
     
-    🔗 **[访问 CFTC 官网报告页面](https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm)**
-    """)
+    st.divider()
+    st.caption("数据源:\n1. CFTC (持仓)\n2. FRED (宏观经济)\n3. Federal Reserve (利率)")
 
-# --- 核心数据逻辑 ---
-@st.cache_data(ttl=3600*12) # 缓存12小时
+# ==============================================================================
+# 模块 1: CFTC 持仓数据 (自动抓取 + 拼合)
+# ==============================================================================
+@st.cache_data(ttl=3600*3)
 def get_cftc_data():
-    current_year = datetime.datetime.now().year
+    year = datetime.datetime.now().year
+    # 模拟用户提到的"2025年政府停摆"场景，如果当前是2024，我们依然去抓取当年的
+    
+    url_history = f"https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
+    url_latest = "https://www.cftc.gov/dea/newcot/f_disagg.txt"
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
+    
+    df_hist = pd.DataFrame()
+    df_live = pd.DataFrame()
+
     try:
-        # 优先下载 2025
-        df = cot.cot_year(current_year, cot_report_type='legacy_fut')
-    except:
-        # 失败则尝试 2024
-        df = cot.cot_year(current_year - 1, cot_report_type='legacy_fut')
-    return df
+        r = requests.get(url_history, headers=headers, verify=False, timeout=10)
+        if r.status_code == 200:
+            df_hist = pd.read_csv(io.BytesIO(r.content), compression='zip', low_memory=False)
+    except: pass
 
-def find_column(columns, keywords):
-    for col in columns:
-        col_lower = str(col).lower()
-        if all(k in col_lower for k in keywords):
-            return col
-    return None
+    try:
+        r2 = requests.get(f"{url_latest}?t={int(time.time())}", headers=headers, verify=False, timeout=5)
+        if r2.status_code == 200 and not df_hist.empty:
+            df_live = pd.read_csv(io.BytesIO(r2.content), header=None, low_memory=False)
+            df_live.columns = df_hist.columns
+    except: pass
 
-def process_data(df, name_keywords):
-    # 1. 找名字
-    name_col = find_column(df.columns, ['contract', 'name']) or \
-               find_column(df.columns, ['market', 'exchange'])
-    if not name_col: return pd.DataFrame()
+    if df_hist.empty and df_live.empty: return pd.DataFrame()
+    return pd.concat([df_hist, df_live], ignore_index=True)
 
-    # 2. 筛选
-    mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in name_keywords))
-    data = df[mask].copy()
-    if data.empty: return pd.DataFrame()
+def process_cftc(df, keywords):
+    if df.empty: return pd.DataFrame()
+    # 简化版处理逻辑
+    try:
+        name_col = [c for c in df.columns if 'Market' in str(c) or 'Contract' in str(c)][0]
+        date_col = [c for c in df.columns if 'Date' in str(c)][0]
+        long_col = [c for c in df.columns if 'Money' in str(c) and 'Long' in str(c)][0]
+        short_col = [c for c in df.columns if 'Money' in str(c) and 'Short' in str(c)][0]
+        
+        mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in keywords))
+        data = df[mask].copy()
+        
+        data[date_col] = pd.to_datetime(data[date_col])
+        data['Net'] = data[long_col] - data[short_col]
+        data = data.sort_values(date_col).drop_duplicates(subset=[date_col], keep='last')
+        return data.tail(52)
+    except: return pd.DataFrame()
 
-    # 3. 找日期
-    date_col = find_column(df.columns, ['date', 'yyyy']) or \
-               find_column(df.columns, ['report', 'date'])
-    data[date_col] = pd.to_datetime(data[date_col])
+# ==============================================================================
+# 模块 2: 宏观经济数据 (FRED API)
+# ==============================================================================
+@st.cache_data(ttl=3600*12)
+def get_macro_data():
+    # start_date = datetime.datetime(2023, 1, 1) # 获取最近两年的数据
+    start_date = datetime.datetime.now() - datetime.timedelta(days=730)
     
-    # 4. 找多空
-    long_col = find_column(df.columns, ['non', 'comm', 'long'])
-    short_col = find_column(df.columns, ['non', 'comm', 'short'])
-    
-    # 5. 计算并清洗
-    data['Net_Pos'] = data[long_col] - data[short_col]
-    data['Date_Display'] = data[date_col]
-    
-    # 去重并排序
-    data = data.sort_values('Date_Display')
-    data = data.drop_duplicates(subset=['Date_Display'], keep='last')
-    
-    return data.tail(52)
+    try:
+        # 1. 联邦基金利率 (Fed Funds Rate)
+        fed_rate = web.DataReader('FEDFUNDS', 'fred', start_date)
+        
+        # 2. 非农就业 (NFP - Total Nonfarm) -> 计算差值(新增人数)
+        nfp = web.DataReader('PAYEMS', 'fred', start_date)
+        nfp['Change'] = nfp['PAYEMS'].diff() 
+        
+        # 3. CPI (Headline & Core) -> 计算年率(YoY)
+        cpi = web.DataReader('CPIAUCSL', 'fred', start_date) # Headline
+        cpi['YoY'] = cpi['CPIAUCSL'].pct_change(12) * 100
+        
+        # 4. 初请失业金 (Jobless Claims)
+        claims = web.DataReader('ICSA', 'fred', start_date)
+        
+        return fed_rate, nfp, cpi, claims
+    except Exception as e:
+        st.error(f"宏观数据获取失败 (FRED源): {e}")
+        return None, None, None, None
 
-# --- 绘图引擎 ---
-def render_pro_chart(data, title, main_color):
-    if data.empty:
-        st.warning(f"Waiting for data: {title}")
-        return
-
-    last_date_obj = data['Date_Display'].iloc[-1]
-    last_date = last_date_obj.strftime('%Y-%m-%d')
-    current_net = data['Net_Pos'].iloc[-1]
+# ==============================================================================
+# 模块 3: UI 渲染组件
+# ==============================================================================
+def render_news_alert(last_date_obj):
+    """检测数据滞后并显示新闻头条"""
+    if not last_date_obj: return
     
-    if len(data) > 1:
-        prev_net = data['Net_Pos'].iloc[-2]
-        change = current_net - prev_net
-    else:
-        change = 0
-    
-    # 检查数据是否过期 (超过10天没更新)
     days_diff = (datetime.datetime.now() - last_date_obj).days
-    is_outdated = days_diff > 10
-
-    # 情绪判断
-    is_bullish = current_net > 0
-    sentiment_color = "#00FF7F" if is_bullish else "#FF4B4B"
-    sentiment_text = "Bullish (看涨)" if is_bullish else "Bearish (看跌)"
-
-    col1, col2 = st.columns([1, 3])
     
-    with col1:
-        st.markdown(f"### {title.split(' ')[0]}")
-        st.caption(f"Report Date: {last_date}")
-        
-        if is_outdated:
-            st.error(f"⚠️ 数据似乎未更新 (滞后 {days_diff} 天)")
-        
-        st.metric(
-            label="Net Positions", 
-            value=f"{int(current_net):,}", 
-            delta=f"{int(change):,}"
-        )
-        
-        st.markdown(f"""
-        <div style="margin-top: 20px; padding: 10px; border-radius: 5px; background-color: rgba(255,255,255,0.05); border-left: 5px solid {sentiment_color}">
-            <small style="color: #aaa">Market Sentiment</small><br>
-            <strong style="color: {sentiment_color}; font-size: 1.1em">{sentiment_text}</strong>
-        </div>
-        """, unsafe_allow_html=True)
+    # 如果数据滞后超过 14 天，触发新闻警报
+    if days_diff > 14:
+        st.error(f"🚨 **MARKET ALERT: 数据严重滞后 ({days_diff}天)**")
+        with st.expander("📰 **News Headline: 为什么数据停更了？** (点击展开)", expanded=True):
+            st.markdown(f"""
+            #### 🏛️ 美国政府停摆导致 CFTC 报告积压
+            **事件影响**: 由于美国政府在 **2025年10月** 期间发生停摆 (Government Shutdown)，CFTC 暂停了所有数据处理。
+            
+            **当前状态**: 
+            * 🚫 **积压中**: 也就是你看到的 {last_date_obj.strftime('%Y-%m-%d')} 数据。
+            * ⏳ **补交作业**: CFTC 正在按时间顺序补发历史报告。
+            * 📅 **恢复预期**: 预计 2026年1月 才能完全追上实时进度。
+            
+            *建议: 短期内请更多参考价格行为 (Price Action) 和实时宏观指标。*
+            """)
 
-    with col2:
+def render_fomc_card():
+    """FOMC 会议日程卡片"""
+    # 这里硬编码 2025/2026 的一些关键日期 (示例)
+    fomc_dates = [
+        datetime.date(2025, 12, 10),
+        datetime.date(2026, 1, 28),
+        datetime.date(2026, 3, 18)
+    ]
+    today = datetime.date.today()
+    next_meet = None
+    for d in fomc_dates:
+        if d >= today:
+            next_meet = d
+            break
+            
+    st.markdown("### 🏦 FOMC 联邦公开市场委员会")
+    
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if next_meet:
+            days_left = (next_meet - today).days
+            st.info(f"📅 下次利率决议: **{next_meet}** (还剩 {days_left} 天)")
+        else:
+            st.info("📅 下次会议: 待定 (TBA)")
+            
+    with c2:
+        # 提供官方链接作为"点阵图"的替代方案
+        st.link_button("📊 查看最新点阵图 (Fed官网)", "https://www.federalreserve.gov/monetarypolicy/fomcprojtabl20250917.htm")
+
+# ==============================================================================
+# 主程序逻辑
+# ==============================================================================
+
+# 1. 抓取数据
+with st.spinner('正在同步华尔街数据...'):
+    cftc_df = get_cftc_data()
+    gold_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
+    euro_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO"])
+    
+    # 宏观数据
+    fed, nfp, cpi, claims = get_macro_data()
+
+# 2. 页面布局
+st.title("Smart Money & Macro Dashboard")
+
+# 3. 顶部：新闻警报检测
+if not gold_data.empty:
+    last_date = gold_data.iloc[-1].name if hasattr(gold_data.iloc[-1], 'name') else gold_data.index[-1]
+    # 注意：上面的 process_cftc 返回的是 DataFrame，最后一列是日期
+    # 这里我们重新取一下日期对象
+    actual_date = gold_data.columns[0] if 'Date' in str(gold_data.columns[0]) else None 
+    # 修正：直接用数据里的日期列
+    cols = gold_data.columns
+    date_col = [c for c in cols if 'Date' in str(c)][0]
+    last_date_val = gold_data.iloc[-1][date_col]
+    
+    render_news_alert(last_date_val)
+
+# 4. 选项卡布局
+tab1, tab2 = st.tabs(["📊 COT 机构持仓", "🌍 宏观经济 (Macro)"])
+
+with tab1:
+    # 渲染 COT 图表 (复用之前的逻辑，简化展示)
+    def simple_chart(data, name, color):
+        if data.empty: return
+        date_c = [c for c in data.columns if 'Date' in str(c)][0]
         fig = go.Figure()
-        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-
-        fig.add_trace(go.Scatter(
-            x=data['Date_Display'], 
-            y=data['Net_Pos'],
-            mode='lines',
-            name='Net Positions',
-            line=dict(color=main_color, width=3, shape='spline', smoothing=1.3),
-            fill='tozeroy',
-            fillcolor=f"rgba{main_color[3:-1]}, 0.1)" if main_color.startswith('rgba') else main_color.replace(')', ', 0.1)').replace('rgb', 'rgba') 
-        ))
-        
-        # 修正颜色透明度逻辑
-        if main_color == "#FFD700": fill_c = "rgba(255, 215, 0, 0.2)"
-        elif main_color == "#00d2ff": fill_c = "rgba(0, 210, 255, 0.2)"
-        else: fill_c = "rgba(235, 64, 52, 0.2)"
-        fig.update_traces(fillcolor=fill_c)
-
-        fig.update_layout(
-            title=dict(text=f"{title} Trend", font=dict(size=14, color="#aaa")),
-            height=400,
-            margin=dict(l=0, r=20, t=30, b=0),
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            hovermode="x unified",
-            xaxis=dict(showgrid=False, title="", type="date", tickformat="%Y-%m-%d"),
-            yaxis=dict(showgrid=True, gridcolor='#333', zeroline=False)
-        )
+        fig.add_trace(go.Scatter(x=data[date_c], y=data['Net'], fill='tozeroy', line=dict(color=color), name='Managed Money'))
+        fig.update_layout(title=f"{name} Net Positions", height=300, margin=dict(t=30,b=0,l=0,r=0))
         st.plotly_chart(fig, use_container_width=True)
-    
+
+    c1, c2 = st.columns(2)
+    with c1: simple_chart(gold_data, "Gold (XAU)", "#FFD700")
+    with c2: simple_chart(euro_data, "Euro (EUR)", "#00d2ff")
+
+with tab2:
+    # --- 宏观面板 ---
+    render_fomc_card()
     st.divider()
-
-# --- 主程序 ---
-st.title("COT 机构持仓透视 (Live)")
-
-with st.spinner('Checking for new data...'):
-    df = get_cftc_data()
-    gold = process_data(df, ["GOLD", "COMMODITY"])
-    euro = process_data(df, ["EURO FX", "CHICAGO"])
-    gbp = process_data(df, ["BRITISH POUND", "STERLING"])
-
-render_pro_chart(gold, "Gold (XAU) / USD", "#FFD700")
-render_pro_chart(euro, "Euro (EUR) / USD", "#00d2ff")
-render_pro_chart(gbp, "Pound (GBP) / USD", "#eb4034")
+    
+    if fed is not None:
+        # 第一行：关键指标大数字
+        m1, m2, m3, m4 = st.columns(4)
+        
+        # 利率
+        curr_rate = fed['FEDFUNDS'].iloc[-1]
+        m1.metric("🇺🇸 Fed Funds Rate", f"{curr_rate:.2f}%", help="美联储基准利率")
+        
+        # CPI 通胀
+        curr_cpi = cpi['YoY'].iloc[-1]
+        prev_cpi = cpi['YoY'].iloc[-2]
+        m2.metric("🔥 CPI Inflation (YoY)", f"{curr_cpi:.1f}%", f"{curr_cpi-prev_cpi:.1f}%", delta_color="inverse")
+        
+        # NFP 非农
+        curr_nfp = int(nfp['Change'].iloc[-1])
+        prev_nfp = int(nfp['Change'].iloc[-2])
+        m3.metric("👷 NFP (非农新增)", f"{curr_nfp:,} K", f"{curr_nfp-prev_nfp:,} K")
+        
+        # 失业金
+        curr_claims = int(claims['ICSA'].iloc[-1])
+        m4.metric("🤕 Jobless Claims", f"{curr_claims:,}", help="初请失业金人数")
+        
+        st.divider()
+        
+        # 第二行：图表展示
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("通胀趋势 (CPI YoY)")
+            st.line_chart(cpi['YoY'].tail(24)) # 只看最近24个月
+        
+        with c2:
+            st.subheader("就业市场 (NFP Change)")
+            st.bar_chart(nfp['Change'].tail(24))
+            
+    else:
+        st.warning("宏观数据加载失败，可能是 FRED 接口暂时繁忙，请稍后刷新。")
