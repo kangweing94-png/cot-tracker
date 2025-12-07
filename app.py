@@ -13,7 +13,7 @@ st.set_page_config(page_title="Smart Money & Macro Pro", page_icon="🏦", layou
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ========= TradingEconomics API Key（你的） =========
+# ========= TradingEconomics API Key（你的，现阶段只用来查状态） =========
 TE_API_KEY = "a7d624f316a049e:nmasw3jt5rkbeoi"
 
 
@@ -25,7 +25,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("数据源:\n- CFTC (COT)\n- TradingEconomics (Macro)\n- FRED 兜底")
+    st.caption("数据源:\n- CFTC (COT)\n- FRED (主数据)\n- TradingEconomics (状态诊断)")
 
 
 # ======================================================================
@@ -86,11 +86,11 @@ def find_column(columns, keywords):
 def process_cftc(df, name_keywords):
     """
     按 name_keywords 筛选某个品种，并算 Managed Money 净持仓
-    这里完全回滚到你之前「能出数据」的逻辑：
-    - 名称列: market+exchange 或 contract+name
-    - XAU: ["GOLD","COMMODITY"]
-    - EUR: ["EURO FX","CHICAGO"]
-    - GBP: ["BRITISH POUND","CHICAGO"]
+    完全用你之前验证过的逻辑：
+      - 名称列: market+exchange 或 contract+name
+      - XAU: ["GOLD","COMMODITY"]
+      - EUR: ["EURO FX","CHICAGO"]
+      - GBP: ["BRITISH POUND","CHICAGO"]
     """
     if df.empty:
         return pd.DataFrame()
@@ -116,7 +116,6 @@ def process_cftc(df, name_keywords):
     )
     if not date_col:
         return pd.DataFrame()
-
     data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
     data = data.dropna(subset=[date_col])
 
@@ -126,65 +125,18 @@ def process_cftc(df, name_keywords):
     if not long_col or not short_col:
         return pd.DataFrame()
 
-    # 5. 计算净持仓
     data["Net"] = data[long_col] - data[short_col]
     data["Date_Display"] = data[date_col]
 
-    # 6. 去重 + 排序
     data = data.sort_values("Date_Display")
     data = data.drop_duplicates(subset=["Date_Display"], keep="last")
 
-    return data.tail(156)  # 保留最近三年周数据
+    return data.tail(156)  # 最近三年
 
 
 # ======================================================================
-# 模块 2: TradingEconomics + FRED 宏观数据
+# 模块 2: FRED 宏观数据 + TE 状态诊断
 # ======================================================================
-
-def _te_historical(country: str, indicator: str):
-    """
-    从 TradingEconomics 拉一个国家 + 指标的历史数据
-    返回 (series, status_text)
-    """
-    if not TE_API_KEY:
-        return None, "TE: 没有 API Key"
-
-    url = f"https://api.tradingeconomics.com/historical/country/{country}/indicator/{indicator}"
-    params = {"c": TE_API_KEY, "f": "json"}
-
-    try:
-        r = requests.get(url, params=params, timeout=8)
-        status = f"TE {indicator} HTTP {r.status_code}"
-        if r.status_code != 200:
-            return None, status
-
-        js = r.json()
-        if not js:
-            return None, status + " (空结果)"
-
-        df = pd.DataFrame(js)
-
-        # 官方常见字段: DateTime + Value
-        candidates_date = ["DateTime", "Date", "date", "Datetime", "datetime"]
-        candidates_val = ["Value", "Close", "value", "close"]
-
-        date_col = next((c for c in candidates_date if c in df.columns), None)
-        val_col = next((c for c in candidates_val if c in df.columns), None)
-
-        if not date_col or not val_col:
-            return None, status + " (字段不匹配)"
-
-        df[date_col] = pd.to_datetime(df[date_col])
-        df = df[[date_col, val_col]].rename(
-            columns={date_col: "DATE", val_col: "VALUE"}
-        )
-        df.set_index("DATE", inplace=True)
-        df.sort_index(inplace=True)
-        return df["VALUE"], status
-
-    except Exception as e:
-        return None, f"TE {indicator} 请求失败: {type(e).__name__}"
-
 
 def _fred_series(series_id: str, backup_name: str):
     """
@@ -220,99 +172,67 @@ def _fred_series(series_id: str, backup_name: str):
         return None, "FRED 无数据"
 
 
-def _first_non_null(*series_list):
-    """按顺序选择第一个非 None 的 series"""
-    for s in series_list:
-        if s is not None:
-            return s
-    return None
+def _te_status_only(country: str, indicator: str):
+    """
+    只拿 TE 的状态码，不用它的数据
+    """
+    if not TE_API_KEY:
+        return "TE: 没有 API Key"
+
+    url = f"https://api.tradingeconomics.com/historical/country/{country}/indicator/{indicator}"
+    params = {"c": TE_API_KEY, "f": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        return f"TE {indicator} HTTP {r.status_code}"
+    except Exception as e:
+        return f"TE {indicator} 请求失败: {type(e).__name__}"
 
 
 @st.cache_data(ttl=3600 * 3)
-def get_macro_multi():
+def get_macro_fred_only():
     """
-    输出:
-      macro_df: index=DATE, columns=[fed_funds, cpi_yoy, nfp_change, jobless_claims]
-      sources: dict 指明每个指标用的是 TE 还是 FRED
+    真正用于绘图/指标的宏观数据全部来自 FRED。
+    同时做一份 TE 状态报告，方便你之后和 TE 客服对话。
     """
-
     sources = {}
 
-    # ===== Fed Funds / Interest Rate =====
-    te_fed, te_fed_status = _te_historical("united states", "interest rate")
-    fred_fed, fred_fed_status = _fred_series("FEDFUNDS", "fedfunds.csv")
+    # Fed Funds
+    fed, fed_src = _fred_series("FEDFUNDS", "fedfunds.csv")
+    te_fed_status = _te_status_only("united states", "interest rate")
+    sources["fed_funds"] = f"{fed_src} | {te_fed_status}"
 
-    fed_series = _first_non_null(te_fed, fred_fed)
-    if fed_series is te_fed:
-        sources["fed_funds"] = f"{te_fed_status}（优先 TE）"
-    elif fed_series is fred_fed:
-        sources["fed_funds"] = f"{fred_fed_status}（TE 失败: {te_fed_status}）"
+    # CPI YoY
+    cpi_raw, cpi_src = _fred_series("CPIAUCSL", "cpi.csv")
+    if cpi_raw is not None:
+        cpi_yoy = cpi_raw.pct_change(12) * 100
     else:
-        sources["fed_funds"] = f"无数据 (TE: {te_fed_status}, FRED: {fred_fed_status})"
+        cpi_yoy = None
+    te_cpi_status = _te_status_only("united states", "inflation rate")
+    sources["cpi_yoy"] = f"{cpi_src} | {te_cpi_status}"
 
-    # ===== CPI YoY =====
-    te_cpi, te_cpi_status = _te_historical("united states", "inflation rate")
-    fred_cpi, fred_cpi_status = _fred_series("CPIAUCSL", "cpi.csv")
-    if fred_cpi is not None:
-        fred_cpi_yoy = fred_cpi.pct_change(12) * 100
+    # NFP Change
+    nfp_raw, nfp_src = _fred_series("PAYEMS", "nfp.csv")
+    if nfp_raw is not None:
+        nfp_change = nfp_raw.diff()
     else:
-        fred_cpi_yoy = None
+        nfp_change = None
+    te_nfp_status = _te_status_only("united states", "non farm payrolls")
+    sources["nfp_change"] = f"{nfp_src} | {te_nfp_status}"
 
-    cpi_series = _first_non_null(te_cpi, fred_cpi_yoy)
-    if cpi_series is te_cpi:
-        sources["cpi_yoy"] = f"{te_cpi_status}（TE 直接给 YoY）"
-    elif cpi_series is fred_cpi_yoy:
-        sources["cpi_yoy"] = f"{fred_cpi_status}（FRED CPI 计算 YoY，TE 失败: {te_cpi_status}）"
-    else:
-        sources["cpi_yoy"] = f"无数据 (TE: {te_cpi_status}, FRED: {fred_cpi_status})"
+    # Jobless Claims
+    claims_raw, claims_src = _fred_series("ICSA", "claims.csv")
+    te_claims_status = _te_status_only("united states", "jobless claims")
+    sources["jobless_claims"] = f"{claims_src} | {te_claims_status}"
 
-    # ===== NFP Change =====
-    te_nfp, te_nfp_status = _te_historical("united states", "non farm payrolls")
-    if te_nfp is not None:
-        te_nfp_change = te_nfp.diff()
-    else:
-        te_nfp_change = None
-
-    fred_nfp, fred_nfp_status = _fred_series("PAYEMS", "nfp.csv")
-    if fred_nfp is not None:
-        fred_nfp_change = fred_nfp.diff()
-    else:
-        fred_nfp_change = None
-
-    nfp_series = _first_non_null(te_nfp_change, fred_nfp_change)
-    if nfp_series is te_nfp_change:
-        sources["nfp_change"] = f"{te_nfp_status}（TE 差分）"
-    elif nfp_series is fred_nfp_change:
-        sources["nfp_change"] = f"{fred_nfp_status}（FRED PAYEMS 差分，TE 失败: {te_nfp_status}）"
-    else:
-        sources["nfp_change"] = f"无数据 (TE: {te_nfp_status}, FRED: {fred_nfp_status})"
-
-    # ===== Jobless Claims =====
-    te_claims, te_claims_status = _te_historical(
-        "united states", "initial jobless claims"
-    )
-    if te_claims is None:
-        te_claims, te_claims_status = _te_historical("united states", "jobless claims")
-
-    fred_claims, fred_claims_status = _fred_series("ICSA", "claims.csv")
-
-    claims_series = _first_non_null(te_claims, fred_claims)
-    if claims_series is te_claims:
-        sources["jobless_claims"] = f"{te_claims_status}"
-    elif claims_series is fred_claims:
-        sources["jobless_claims"] = f"{fred_claims_status}（TE 失败: {te_claims_status}）"
-    else:
-        sources["jobless_claims"] = f"无数据 (TE: {te_claims_status}, FRED: {fred_claims_status})"
-
-    # ===== 组装 DataFrame =====
+    # 组装 DataFrame
     series_map = {
-        "fed_funds": fed_series,
-        "cpi_yoy": cpi_series,
-        "nfp_change": nfp_series,
-        "jobless_claims": claims_series,
+        "fed_funds": fed,
+        "cpi_yoy": cpi_yoy,
+        "nfp_change": nfp_change,
+        "jobless_claims": claims_raw,
     }
-
     non_null = {k: v for k, v in series_map.items() if v is not None}
+
     if not non_null:
         return pd.DataFrame(), sources
 
@@ -360,7 +280,7 @@ def render_fomc_card():
 
 def cot_chart(data, title, color):
     if data.empty:
-        st.warning(f"{title}: 暂无数据（检查名称匹配或 CFTC 原始文件）")
+        st.warning(f"{title}: 暂无数据")
         return
 
     last_row = data.iloc[-1]
@@ -398,8 +318,8 @@ with st.spinner("正在同步 COT & 宏观数据…"):
     eur_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO"])
     gbp_data = process_cftc(cftc_df, ["BRITISH POUND", "CHICAGO"])
 
-    # 宏观（TE 优先 + FRED 兜底）
-    macro_df, macro_sources = get_macro_multi()
+    # 宏观：FRED 为主，TE 做状态诊断
+    macro_df, macro_sources = get_macro_fred_only()
 
 st.title("Smart Money & Macro Dashboard")
 
@@ -407,7 +327,7 @@ st.title("Smart Money & Macro Dashboard")
 if not xau_data.empty:
     render_cftc_alert(xau_data.iloc[-1]["Date_Display"])
 
-tab1, tab2 = st.tabs(["📊 COT 持仓（XAU / EUR / GBP）", "🌍 宏观经济（TE + FRED）"])
+tab1, tab2 = st.tabs(["📊 COT 持仓（XAU / EUR / GBP）", "🌍 宏观经济（FRED + TE 状态）"])
 
 
 # ---------- Tab1: COT ----------
@@ -429,11 +349,11 @@ with tab2:
     render_fomc_card()
     st.divider()
 
-    st.subheader("📌 宏观数据来源（调试用）")
+    st.subheader("📌 宏观数据来源（FRED + TE 检测）")
     st.json(macro_sources)
 
     if macro_df.empty:
-        st.warning("没有任何宏观数据可用。看上面的 JSON，具体是 TE 拒绝还是 FRED 也拉不到。")
+        st.warning("FRED 也拉不到数据（网络或被墙），宏观区暂时空白。")
     else:
         latest = macro_df.dropna().iloc[-1]
 
@@ -442,7 +362,7 @@ with tab2:
         # Fed Funds
         if "fed_funds" in macro_df.columns and pd.notna(latest.get("fed_funds", None)):
             m1.metric(
-                "🇺🇸 Fed Funds / Interest Rate",
+                "🇺🇸 Fed Funds Rate",
                 f"{latest['fed_funds']:.2f}%",
             )
         else:
@@ -458,9 +378,7 @@ with tab2:
             m2.write("CPI YoY: 无数据")
 
         # NFP Change
-        if "nfp_change" in macro_df.columns and pd.notna(
-            latest.get("nfp_change", None)
-        ):
+        if "nfp_change" in macro_df.columns and pd.notna(latest.get("nfp_change", None)):
             m3.metric(
                 "👷 NFP Change",
                 f"{int(latest['nfp_change']):,}",
