@@ -15,8 +15,8 @@ DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ========= API KEYS =========
-TE_API_KEY = "a7d624f316a049e:nmasw3jt5rkbeoi"          # TradingEconomics，只做状态检测
-FRED_API_KEY = "476ef255e486edb3fdbf71115caa2857"      # FRED 官方 API，用来拉宏观数据
+TE_API_KEY = "a7d624f316a049e:nmasw3jt5rkbeoi"          # TradingEconomics：只做状态
+FRED_API_KEY = "476ef255e486edb3fdbf71115caa2857"      # FRED 官方 API：主宏观数据
 
 
 # ========= 侧边栏 =========
@@ -86,28 +86,32 @@ def find_column(columns, keywords):
 
 def process_cftc(df, name_keywords):
     """
-    用你之前确认 OK 的逻辑筛品种：
-    - 名称列: market+exchange 或 contract+name
-    - XAU: ["GOLD","COMMODITY"]
-    - EUR: ["EURO FX","CHICAGO"]
-    - GBP: ["BRITISH POUND","CHICAGO"]
+    筛选芝商所主力合约 + 计算 Managed Money 净持仓
+    name_keywords 里放的是一组「必须全部包含的关键字」，比如：
+      - GOLD: ["GOLD", "COMMODITY"]
+      - EUR:  ["EURO FX", "CHICAGO MERCANTILE"]
+      - GBP:  ["BRITISH POUND STERLING", "CHICAGO MERCANTILE"]
     """
     if df.empty:
         return pd.DataFrame()
 
+    # 合约名称列
     name_col = find_column(df.columns, ["market", "exchange"]) or find_column(
         df.columns, ["contract", "name"]
     )
     if not name_col:
         return pd.DataFrame()
 
-    mask = df[name_col].apply(
-        lambda x: any(k in str(x).upper() for k in name_keywords)
-    )
+    def _match_name(x):
+        s = str(x).upper()
+        return all(k.upper() in s for k in name_keywords)
+
+    mask = df[name_col].apply(_match_name)
     data = df[mask].copy()
     if data.empty:
         return pd.DataFrame()
 
+    # 日期列
     date_col = find_column(df.columns, ["report", "date"]) or find_column(
         df.columns, ["as", "of", "date"]
     )
@@ -116,6 +120,7 @@ def process_cftc(df, name_keywords):
     data[date_col] = pd.to_datetime(data[date_col], errors="coerce")
     data = data.dropna(subset=[date_col])
 
+    # Managed Money 多空列
     long_col = find_column(df.columns, ["money", "long"])
     short_col = find_column(df.columns, ["money", "short"])
     if not long_col or not short_col:
@@ -136,7 +141,8 @@ def process_cftc(df, name_keywords):
 
 def _fred_api_series(series_id: str, start="1990-01-01"):
     """
-    调用 FRED 官方 API，返回 series(index=DATE, value=float) 或 None
+    调用 FRED 官方 API，返回 (series, status_text)
+    注意：不再传 frequency，避免 400。
     """
     if not FRED_API_KEY:
         return None, "FRED: 无 API Key"
@@ -148,7 +154,6 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
         "file_type": "json",
         "observation_start": start,
         "observation_end": "9999-12-31",
-        "frequency": "m" if series_id == "CPIAUCSL" else "d",  # 大部分日频，CPI 月频
     }
 
     try:
@@ -173,7 +178,7 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
                 if math.isnan(val):
                     continue
             except ValueError:
-                # FRED 用 '.' 表示缺失
+                # '.' 等缺失值
                 continue
             dates.append(d)
             values.append(val)
@@ -185,14 +190,14 @@ def _fred_api_series(series_id: str, start="1990-01-01"):
         df.set_index("DATE", inplace=True)
         df.sort_index(inplace=True)
 
-        # 简单备份一份到本地，方便断网时用
+        # 简单备份一份
         backup_name = f"{series_id}.csv"
         df.to_csv(os.path.join(DATA_DIR, backup_name))
 
         return df["VALUE"], f"FRED {series_id} API 正常 ({len(df)} 条)"
 
     except Exception as e:
-        # 尝试读本地备份
+        # 尝试本地备份
         backup_name = f"{series_id}.csv"
         try:
             path = os.path.join(DATA_DIR, backup_name)
@@ -308,7 +313,7 @@ def render_fomc_card():
 
 def cot_chart(data, title, color):
     if data.empty:
-        st.warning(f"{title}: 暂无数据")
+        st.warning(f"{title}: 暂无数据（可能 CFTC 原始文件里合约名不一致）")
         return
 
     last_row = data.iloc[-1]
@@ -343,10 +348,10 @@ with st.spinner("正在同步 COT & 宏观数据…"):
     # CFTC
     cftc_df = get_cftc_data()
     xau_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
-    eur_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO"])
-    gbp_data = process_cftc(cftc_df, ["BRITISH POUND", "CHICAGO"])
+    eur_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO MERCANTILE"])
+    gbp_data = process_cftc(cftc_df, ["BRITISH POUND STERLING", "CHICAGO MERCANTILE"])
 
-    # 宏观：FRED API 为主，TE 只是状态
+    # 宏观：FRED API 为主，TE 只做状态
     macro_df, macro_sources = get_macro_from_fred()
 
 st.title("Smart Money & Macro Dashboard")
@@ -355,21 +360,22 @@ st.title("Smart Money & Macro Dashboard")
 if not xau_data.empty:
     render_cftc_alert(xau_data.iloc[-1]["Date_Display"])
 
-tab1, tab2 = st.tabs(["📊 COT 持仓（XAU / EUR / GBP）", "🌍 宏观经济（FRED API + TE 状态）"])
+tab1, tab2 = st.tabs(["📊 COT 持仓（EUR / GBP / XAU）", "🌍 宏观经济（FRED API + TE 状态）"])
 
 
 # ---------- Tab1: COT ----------
 with tab1:
+    # 上排：EUR + GBP
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Gold (XAU) 期货 - Managed Money 净持仓")
-        cot_chart(xau_data, "Gold (XAU)", "#FFD700")
-    with c2:
         st.subheader("Euro (EUR) 期货 - Managed Money 净持仓")
         cot_chart(eur_data, "Euro (EUR)", "#00d2ff")
+    with c2:
+        st.subheader("British Pound (GBP) 期货 - Managed Money 净持仓")
+        cot_chart(gbp_data, "British Pound (GBP)", "#ff7f0e")
 
-    st.subheader("British Pound (GBP) 期货 - Managed Money 净持仓")
-    cot_chart(gbp_data, "British Pound (GBP)", "#ff7f0e")
+    st.subheader("Gold (XAU) 期货 - Managed Money 净持仓")
+    cot_chart(xau_data, "Gold (XAU)", "#FFD700")
 
 
 # ---------- Tab2: 宏观 ----------
@@ -402,7 +408,9 @@ with tab2:
         else:
             m3.write("NFP Change: 无数据")
 
-        if "jobless_claims" in macro_df.columns and pd.notna(latest.get("jobless_claims", None)):
+        if "jobless_claims" in macro_df.columns and pd.notna(
+            latest.get("jobless_claims", None)
+        ):
             m4.metric("🤕 Jobless Claims", f"{int(latest['jobless_claims']):,}")
         else:
             m4.write("Jobless Claims: 无数据")
