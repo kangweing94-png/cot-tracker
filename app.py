@@ -6,6 +6,7 @@ import requests
 import io
 import time
 import pytz
+import os
 
 # --- 页面配置 ---
 st.set_page_config(page_title="Smart Money & Macro Pro", page_icon="🏦", layout="wide")
@@ -18,10 +19,10 @@ with st.sidebar:
         st.rerun()
     
     st.divider()
-    st.caption("数据源:\n1. CFTC (持仓)\n2. FRED (宏观经济)")
+    st.caption("数据源:\n1. CFTC (持仓)\n2. FRED (宏观经济 / 本地备份)")
 
 # ==============================================================================
-# 模块 1: CFTC 核心逻辑 (回滚到最稳定的版本)
+# 模块 1: CFTC 核心逻辑
 # ==============================================================================
 @st.cache_data(ttl=3600*3)
 def get_cftc_data():
@@ -40,7 +41,8 @@ def get_cftc_data():
         r = requests.get(url_history, headers=headers, verify=False, timeout=10)
         if r.status_code == 200:
             df_hist = pd.read_csv(io.BytesIO(r.content), compression='zip', low_memory=False)
-    except: pass
+    except:
+        pass
 
     # 2. 下载本周实时包
     try:
@@ -48,13 +50,15 @@ def get_cftc_data():
         if r2.status_code == 200:
             if not df_hist.empty:
                 df_live = pd.read_csv(io.BytesIO(r2.content), header=None, low_memory=False)
-                df_live.columns = df_hist.columns # 强行对齐列名
-    except: pass
+                df_live.columns = df_hist.columns  # 强行对齐列名
+    except:
+        pass
 
-    if df_hist.empty and df_live.empty: return pd.DataFrame()
+    if df_hist.empty and df_live.empty:
+        return pd.DataFrame()
     return pd.concat([df_hist, df_live], ignore_index=True)
 
-# 🔥 关键修复：恢复了 helper 函数，不再使用简化的列表推导
+# 🔥 helper: 找列名
 def find_column(columns, keywords):
     for col in columns:
         col_lower = str(col).lower()
@@ -63,17 +67,20 @@ def find_column(columns, keywords):
     return None
 
 def process_cftc(df, name_keywords):
-    if df.empty: return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
 
     # 1. 找名字 (Name/Market)
     name_col = find_column(df.columns, ['market', 'exchange']) or \
                find_column(df.columns, ['contract', 'name'])
-    if not name_col: return pd.DataFrame()
+    if not name_col:
+        return pd.DataFrame()
 
     # 2. 筛选 (Gold/Euro)
     mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in name_keywords))
     data = df[mask].copy()
-    if data.empty: return pd.DataFrame()
+    if data.empty:
+        return pd.DataFrame()
 
     # 3. 找日期 (Date)
     date_col = find_column(df.columns, ['report', 'date']) or \
@@ -84,7 +91,8 @@ def process_cftc(df, name_keywords):
     long_col = find_column(df.columns, ['money', 'long'])
     short_col = find_column(df.columns, ['money', 'short'])
     
-    if not long_col or not short_col: return pd.DataFrame()
+    if not long_col or not short_col:
+        return pd.DataFrame()
     
     # 5. 计算净持仓
     data['Net'] = data[long_col] - data[short_col]
@@ -97,46 +105,78 @@ def process_cftc(df, name_keywords):
     return data.tail(52)
 
 # ==============================================================================
-# 模块 2: 宏观经济数据 (纯 CSV 读取版，稳定)
+# 模块 2: 宏观经济数据 (FRED + 本地备份兜底)
 # ==============================================================================
 @st.cache_data(ttl=3600*12)
 def get_macro_data():
+    """
+    优先从 FRED 在线获取；若失败，则自动读取本地 data/*.csv 备份。
+    返回: fed_rate, nfp, cpi, claims, macro_sources
+    macro_sources: dict, 例如 {"FEDFUNDS": "FRED 在线", "CPIAUCSL": "本地备份"}
+    """
     base_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
-    
-    def fetch_fred(series_id):
+
+    def fetch_fred(series_id, backup_name):
+        """
+        尝试从 FRED 下载；失败则读取本地 data/backup_name。
+        返回: df, source_text
+        """
+        headers = {"User-Agent": "Mozilla/5.0"}
+        url = f"{base_url}{series_id}"
+
+        # 1. 尝试在线获取
         try:
-            # 增加 User-Agent 防止被拒
-            headers = {"User-Agent": "Mozilla/5.0"}
-            r = requests.get(f"{base_url}{series_id}", headers=headers, timeout=5)
-            if r.status_code == 200:
-                df = pd.read_csv(io.BytesIO(r.content))
+            r = requests.get(url, headers=headers, timeout=5)
+            r.raise_for_status()
+            df = pd.read_csv(io.BytesIO(r.content))
+            df['DATE'] = pd.to_datetime(df['DATE'])
+            df.set_index('DATE', inplace=True)
+
+            # ✅ 在线成功就顺手存一份备份
+            os.makedirs("data", exist_ok=True)
+            df.to_csv(os.path.join("data", backup_name))
+            return df, "FRED 在线"
+        except Exception:
+            # 2. 尝试读取本地备份
+            try:
+                backup_path = os.path.join("data", backup_name)
+                df = pd.read_csv(backup_path)
                 df['DATE'] = pd.to_datetime(df['DATE'])
                 df.set_index('DATE', inplace=True)
-                return df
-        except: return None
-        return None
+                return df, "本地备份"
+            except Exception:
+                return None, "无数据"
+
+    macro_sources = {}
 
     # 1. 联邦基金利率
-    fed_rate = fetch_fred('FEDFUNDS')
-    
+    fed_rate, src_fed = fetch_fred('FEDFUNDS', 'fedfunds.csv')
+    macro_sources['FEDFUNDS'] = src_fed
+
     # 2. 非农就业
-    nfp = fetch_fred('PAYEMS')
-    if nfp is not None: nfp['Change'] = nfp['PAYEMS'].diff()
-    
+    nfp, src_nfp = fetch_fred('PAYEMS', 'nfp.csv')
+    macro_sources['PAYEMS'] = src_nfp
+    if nfp is not None:
+        nfp['Change'] = nfp['PAYEMS'].diff()
+
     # 3. CPI 通胀
-    cpi = fetch_fred('CPIAUCSL')
-    if cpi is not None: cpi['YoY'] = cpi['CPIAUCSL'].pct_change(12) * 100
-        
+    cpi, src_cpi = fetch_fred('CPIAUCSL', 'cpi.csv')
+    macro_sources['CPIAUCSL'] = src_cpi
+    if cpi is not None:
+        cpi['YoY'] = cpi['CPIAUCSL'].pct_change(12) * 100
+
     # 4. 初请失业金
-    claims = fetch_fred('ICSA')
-    
-    return fed_rate, nfp, cpi, claims
+    claims, src_claims = fetch_fred('ICSA', 'claims.csv')
+    macro_sources['ICSA'] = src_claims
+
+    return fed_rate, nfp, cpi, claims, macro_sources
 
 # ==============================================================================
 # UI 组件
 # ==============================================================================
 def render_news_alert(last_date_obj):
-    if pd.isnull(last_date_obj): return
+    if pd.isnull(last_date_obj):
+        return
     days_diff = (datetime.datetime.now() - last_date_obj).days
     
     if days_diff > 14:
@@ -171,15 +211,14 @@ def render_fomc_card():
 # ==============================================================================
 # 主程序
 # ==============================================================================
-
 with st.spinner('正在同步华尔街数据...'):
+    # CFTC 数据
     cftc_df = get_cftc_data()
-    # 恢复了你最满意的黄金数据处理逻辑
     gold_data = process_cftc(cftc_df, ["GOLD", "COMMODITY"])
     euro_data = process_cftc(cftc_df, ["EURO FX", "CHICAGO"])
     
-    # 宏观数据
-    fed, nfp, cpi, claims = get_macro_data()
+    # 宏观数据 (带本地备份)
+    fed, nfp, cpi, claims, macro_sources = get_macro_data()
 
 st.title("Smart Money & Macro Dashboard")
 
@@ -191,6 +230,7 @@ if not gold_data.empty:
 # 选项卡
 tab1, tab2 = st.tabs(["📊 COT 机构持仓", "🌍 宏观经济 (Macro)"])
 
+# ---------------------- Tab 1: COT ----------------------
 with tab1:
     def simple_chart(data, name, color):
         if data.empty: 
@@ -205,14 +245,23 @@ with tab1:
         
         # 图表
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=data['Date_Display'], y=data['Net'], fill='tozeroy', line=dict(color=color), name='Net Pos'))
-        fig.update_layout(height=350, margin=dict(t=10,b=0,l=0,r=0))
+        fig.add_trace(go.Scatter(
+            x=data['Date_Display'],
+            y=data['Net'],
+            fill='tozeroy',
+            line=dict(color=color),
+            name='Net Pos'
+        ))
+        fig.update_layout(height=350, margin=dict(t=10, b=0, l=0, r=0))
         st.plotly_chart(fig, use_container_width=True)
 
     c1, c2 = st.columns(2)
-    with c1: simple_chart(gold_data, "Gold (XAU)", "#FFD700")
-    with c2: simple_chart(euro_data, "Euro (EUR)", "#00d2ff")
+    with c1:
+        simple_chart(gold_data, "Gold (XAU)", "#FFD700")
+    with c2:
+        simple_chart(euro_data, "Euro (EUR)", "#00d2ff")
 
+# ---------------------- Tab 2: 宏观 ----------------------
 with tab2:
     render_fomc_card()
     st.divider()
@@ -237,21 +286,32 @@ with tab2:
             m3.metric("👷 NFP Change", f"{curr_nfp:,} K", f"{curr_nfp-prev_nfp:,} K")
         
         # Claims
-        if claims is not None:
+        if claims is not None and not claims.empty:
             curr_claims = int(claims['ICSA'].iloc[-1])
             m4.metric("🤕 Jobless Claims", f"{curr_claims:,}")
         
+        # 标记当前宏观数据来源
+        source_set = set(macro_sources.values())
+        source_text = " / ".join(sorted(s for s in source_set if s != "无数据")) or "无数据"
+        st.caption(f"当前宏观数据来源：{source_text}（如显示“本地备份”，说明暂时无法实时连接 FRED）")
+
         st.divider()
         
         # 图表
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("通胀趋势 (CPI YoY)")
-            if cpi is not None: st.line_chart(cpi['YoY'].tail(24))
+            if cpi is not None and 'YoY' in cpi.columns:
+                st.line_chart(cpi['YoY'].tail(24))
+            else:
+                st.info("暂无 CPI YoY 数据")
         
         with c2:
             st.subheader("就业市场 (NFP Change)")
-            if nfp is not None: st.bar_chart(nfp['Change'].tail(24))
+            if nfp is not None and 'Change' in nfp.columns:
+                st.bar_chart(nfp['Change'].tail(24))
+            else:
+                st.info("暂无 NFP Change 数据")
             
     else:
-        st.warning("宏观数据暂不可用 (FRED API 连接超时)，请稍后刷新。")
+        st.warning("宏观数据暂不可用，且本地备份为空。请稍后刷新或检查网络连接。")
