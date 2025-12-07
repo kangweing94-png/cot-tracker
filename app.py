@@ -5,57 +5,61 @@ import datetime
 import pytz
 import requests
 import io
+import time
+import random
 
 # --- 页面设置 ---
 st.set_page_config(page_title="COT Pro Dashboard", page_icon="📊", layout="wide")
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.header("📅 CFTC 发布时间表")
+    st.header("📅 CFTC 实时状态")
     
-    tz_et = pytz.timezone('US/Eastern')
     tz_my = pytz.timezone('Asia/Kuala_Lumpur')
-    now_et = datetime.datetime.now(tz_et)
-    friday = now_et + datetime.timedelta((4 - now_et.weekday()) % 7)
-    release_time = friday.replace(hour=15, minute=30, second=0, microsecond=0)
+    now_my = datetime.datetime.now(tz_my)
     
-    if now_et > release_time:
-        release_time += datetime.timedelta(days=7)
-    
-    release_my = release_time.astimezone(tz_my)
-    
-    st.info(f"""
-    **下一次数据更新:**
-    🇺🇸 美东: {release_time.strftime('%b %d %H:%M')}
-    🇲🇾 大马: {release_my.strftime('%b %d %H:%M')}
-    """)
+    st.info(f"当前时间 (MYT):\n{now_my.strftime('%Y-%m-%d %H:%M')}")
     
     st.divider()
-    if st.button("🔄 强制刷新 (Force Refresh)"):
+    if st.button("🚀 强力刷新 (Force Fetch)"):
         st.cache_data.clear()
         st.rerun()
 
-# --- 🔥 核心修复：直连 CFTC 官网下载 ---
-@st.cache_data(ttl=3600*6)
+# --- 核心数据下载 (增强版) ---
+@st.cache_data(ttl=3600*1) # 缩短缓存时间到1小时
 def get_cftc_data():
     year = datetime.datetime.now().year
-    # CFTC 官方直接下载地址 (Legacy Futures Only)
-    # 格式通常是: https://www.cftc.gov/files/dea/history/deacot{year}.zip
-    url = f"https://www.cftc.gov/files/dea/history/deacot{year}.zip"
+    
+    # 1. 设置伪装头部 (非常重要，防止被拦截)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Cache-Control": "no-cache", 
+        "Pragma": "no-cache"
+    }
+
+    # 2. 构造带时间戳的 URL (防止服务器缓存)
+    # 格式: deacot2025.zip?t=1709238492
+    ts = int(time.time())
+    url = f"https://www.cftc.gov/files/dea/history/deacot{year}.zip?t={ts}&r={random.randint(1, 10000)}"
+    
+    status_placeholder = st.empty()
+    status_placeholder.text(f"正在尝试从 CFTC 下载最新数据 ({year})...")
     
     try:
-        # 使用 requests 下载 zip 文件
-        response = requests.get(url, verify=False) # verify=False 防止SSL证书报错
+        # 3. 发起请求
+        response = requests.get(url, headers=headers, verify=False, timeout=30)
         response.raise_for_status()
         
-        # 直接用 pandas 读取内存中的 zip
-        # CFTC 的 zip 里通常只有一个叫 annual.txt 的文件
+        # 4. 读取数据
         df = pd.read_csv(io.BytesIO(response.content), compression='zip', low_memory=False)
+        status_placeholder.empty()
         return df
         
     except Exception as e:
-        st.error(f"直连 CFTC 失败，尝试读取历史备份... 错误: {e}")
-        # 如果今年下载失败（比如年初），尝试去年的
+        status_placeholder.error(f"下载 2025 数据失败: {e}")
+        # 如果今年失败，尝试回退到去年作为保底
         try:
             prev_url = f"https://www.cftc.gov/files/dea/history/deacot{year-1}.zip"
             df = pd.read_csv(prev_url, compression='zip', low_memory=False)
@@ -63,7 +67,7 @@ def get_cftc_data():
         except:
             return pd.DataFrame()
 
-# --- 辅助函数 ---
+# --- 数据处理 ---
 def find_column(columns, keywords):
     for col in columns:
         col_lower = str(col).lower()
@@ -74,32 +78,33 @@ def find_column(columns, keywords):
 def process_data(df, name_keywords):
     if df.empty: return pd.DataFrame()
 
-    # 1. 找名字 (CFTC 原生文件列名通常是 "Market_and_Exchange_Names")
+    # 找名字
     name_col = find_column(df.columns, ['market', 'exchange']) or \
                find_column(df.columns, ['contract', 'name'])
-    
     if not name_col: return pd.DataFrame()
 
-    # 2. 筛选
+    # 筛选
     mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in name_keywords))
     data = df[mask].copy()
-    if data.empty: return pd.DataFrame()
-
-    # 3. 找日期 (通常是 "Report_Date_as_YYYY-MM-DD")
+    
+    # 找日期
     date_col = find_column(df.columns, ['report', 'date']) or \
                find_column(df.columns, ['as', 'of', 'date'])
+    if not date_col: return pd.DataFrame()
+    
     data[date_col] = pd.to_datetime(data[date_col])
     
-    # 4. 找多空 (通常是 "NonComm_Positions_Long_All")
+    # 找多空
     long_col = find_column(df.columns, ['non', 'comm', 'long'])
     short_col = find_column(df.columns, ['non', 'comm', 'short'])
     
     if not long_col or not short_col: return pd.DataFrame()
     
-    # 5. 计算
+    # 计算
     data['Net_Pos'] = data[long_col] - data[short_col]
     data['Date_Display'] = data[date_col]
     
+    # 去重逻辑
     data = data.sort_values('Date_Display')
     data = data.drop_duplicates(subset=['Date_Display'], keep='last')
     
@@ -108,7 +113,7 @@ def process_data(df, name_keywords):
 # --- 绘图 ---
 def render_pro_chart(data, title, main_color):
     if data.empty:
-        st.warning(f"Waiting for data: {title}")
+        st.warning(f"暂无数据: {title}")
         return
 
     last_date_obj = data['Date_Display'].iloc[-1]
@@ -121,28 +126,29 @@ def render_pro_chart(data, title, main_color):
     else:
         change = 0
     
+    # 智能检查: 数据是否严重滞后
     days_diff = (datetime.datetime.now() - last_date_obj).days
-    is_outdated = days_diff > 14 # 如果超过14天没更新才报警
+    is_outdated = days_diff > 14 
 
-    is_bullish = current_net > 0
-    sentiment_color = "#00FF7F" if is_bullish else "#FF4B4B"
-    sentiment_text = "Bullish" if is_bullish else "Bearish"
+    sentiment_color = "#00FF7F" if current_net > 0 else "#FF4B4B"
+    sentiment_text = "Bullish" if current_net > 0 else "Bearish"
 
     col1, col2 = st.columns([1, 3])
     
     with col1:
         st.markdown(f"### {title.split(' ')[0]}")
-        st.caption(f"Report Date: {last_date}")
+        st.caption(f"最新报告日期: {last_date}")
         
         if is_outdated:
-            st.error(f"⚠️ 数据滞后 {days_diff} 天")
-            st.caption("尝试点击侧边栏的刷新按钮")
-        
+            st.error(f"⚠️ 数据严重滞后 ({days_diff} 天)")
+            st.info("提示: CFTC 官网可能尚未更新 2025 年总表，这是政府端的延迟。")
+        else:
+            st.success("✅ 数据已更新")
+            
         st.metric(label="Net Positions", value=f"{int(current_net):,}", delta=f"{int(change):,}")
         
         st.markdown(f"""
         <div style="margin-top: 20px; padding: 10px; border-radius: 5px; background-color: rgba(255,255,255,0.05); border-left: 5px solid {sentiment_color}">
-            <small style="color: #aaa">Market Sentiment</small><br>
             <strong style="color: {sentiment_color}; font-size: 1.1em">{sentiment_text}</strong>
         </div>
         """, unsafe_allow_html=True)
@@ -167,7 +173,7 @@ def render_pro_chart(data, title, main_color):
 
         fig.update_layout(
             title=dict(text=f"{title} Trend", font=dict(size=14, color="#aaa")),
-            height=400,
+            height=380,
             margin=dict(l=0, r=20, t=30, b=0),
             plot_bgcolor='rgba(0,0,0,0)',
             paper_bgcolor='rgba(0,0,0,0)',
@@ -178,15 +184,8 @@ def render_pro_chart(data, title, main_color):
     st.divider()
 
 # --- 主程序 ---
-st.title("COT 机构持仓透视 (Direct Source)")
+st.title("COT 机构持仓透视 (Pro)")
 
-with st.spinner('Downloading directly from CFTC.gov...'):
+with st.spinner('正在连接 CFTC 美国政府服务器...'):
     df = get_cftc_data()
-    # 关键词不需要变，CFTC源文件里名字是一样的
-    gold = process_data(df, ["GOLD", "COMMODITY"])
-    euro = process_data(df, ["EURO FX", "CHICAGO"])
-    gbp = process_data(df, ["BRITISH POUND", "STERLING"])
-
-render_pro_chart(gold, "Gold (XAU) / USD", "#FFD700")
-render_pro_chart(euro, "Euro (EUR) / USD", "#00d2ff")
-render_pro_chart(gbp, "Pound (GBP) / USD", "#eb4034")
+    gold = process_data(df, ["
