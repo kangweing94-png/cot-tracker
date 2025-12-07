@@ -40,7 +40,6 @@ def get_cftc_data():
     }
 
     # 2. 构造带时间戳的 URL (防止服务器缓存)
-    # 格式: deacot2025.zip?t=1709238492
     ts = int(time.time())
     url = f"https://www.cftc.gov/files/dea/history/deacot{year}.zip?t={ts}&r={random.randint(1, 10000)}"
     
@@ -188,4 +187,10 @@ st.title("COT 机构持仓透视 (Pro)")
 
 with st.spinner('正在连接 CFTC 美国政府服务器...'):
     df = get_cftc_data()
-    gold = process_data(df, ["
+    gold = process_data(df, ["GOLD", "COMMODITY"])
+    euro = process_data(df, ["EURO FX", "CHICAGO"])
+    gbp = process_data(df, ["BRITISH POUND", "STERLING"])
+
+render_pro_chart(gold, "Gold (XAU) / USD", "#FFD700")
+render_pro_chart(euro, "Euro (EUR) / USD", "#00d2ff")
+render_pro_chart(gbp, "Pound (GBP) / USD", "#eb4034")
