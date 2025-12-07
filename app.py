@@ -5,146 +5,170 @@ import cot_reports as cot
 import datetime
 
 # --- 页面设置 ---
-st.set_page_config(page_title="COT Tracker Pro", page_icon="📈", layout="centered")
+st.set_page_config(page_title="COT Pro Dashboard", page_icon="📊", layout="wide") # 改为宽屏模式
 
-st.title("COT 机构持仓追踪 (Smart Fix)")
-st.info("数据来源: CFTC 官方报告 (Legacy Report - Futures Only)")
+st.title("COT 机构持仓透视 (Pro Visuals)")
+st.markdown("""
+<style>
+/* 简单的 CSS 让指标卡片更好看 */
+div[data-testid="metric-container"] {
+    background-color: #262730;
+    padding: 15px;
+    border-radius: 10px;
+    border: 1px solid #444;
+}
+</style>
+""", unsafe_allow_html=True)
 
-# --- 核心函数: 获取数据 ---
+# --- 核心数据逻辑 ---
 @st.cache_data(ttl=3600*6)
 def get_cftc_data():
     current_year = datetime.datetime.now().year
     try:
-        # 优先下载 2025 数据
         df = cot.cot_year(current_year, cot_report_type='legacy_fut')
-    except Exception:
-        # 如果失败，回退到 2024
+    except:
         df = cot.cot_year(current_year - 1, cot_report_type='legacy_fut')
     return df
 
-# --- 智能列名搜索 (解决报错的关键) ---
 def find_column(columns, keywords):
-    """
-    在所有列名中，寻找包含所有关键词的那一列。
-    例如: keywords=['non', 'comm', 'long'] -> 匹配 'Non-Commercial Positions-Long (All)'
-    """
     for col in columns:
-        # 把列名转成小写来比较，忽略大小写差异
         col_lower = str(col).lower()
-        # 检查是否包含所有关键词
         if all(k in col_lower for k in keywords):
             return col
     return None
 
-# --- 数据处理 ---
 def process_data(df, name_keywords):
-    # 1. 寻找合约名称列 (Contract Name)
+    # 1. 找名字
     name_col = find_column(df.columns, ['contract', 'name']) or \
                find_column(df.columns, ['market', 'exchange'])
-    
-    if not name_col:
-        st.error(f"严重错误: 找不到合约名称列。")
-        st.write("现有列名:", list(df.columns))
-        st.stop()
+    if not name_col: return pd.DataFrame()
 
-    # 2. 筛选品种 (比如 XAUUSD)
-    # 只要包含关键词就匹配 (例如 "GOLD")
+    # 2. 筛选
     mask = df[name_col].apply(lambda x: any(k in str(x).upper() for k in name_keywords))
     data = df[mask].copy()
-    
-    if data.empty:
-        return pd.DataFrame()
+    if data.empty: return pd.DataFrame()
 
-    # 3. 寻找日期列
+    # 3. 找日期
     date_col = find_column(df.columns, ['date', 'yyyy']) or \
                find_column(df.columns, ['report', 'date'])
+    data[date_col] = pd.to_datetime(data[date_col])
     
-    if date_col:
-        data[date_col] = pd.to_datetime(data[date_col])
-        data = data.sort_values(date_col)
-    
-    # 4. 寻找多空持仓列 (关键步骤)
-    # 我们找包含 "non", "comm", "long" 的列 -> 多头
+    # 4. 找多空
     long_col = find_column(df.columns, ['non', 'comm', 'long'])
-    # 我们找包含 "non", "comm", "short" 的列 -> 空头
     short_col = find_column(df.columns, ['non', 'comm', 'short'])
-
-    # 如果还是找不到，把所有列名打印出来给用户看 (调试用)
-    if not long_col or not short_col:
-        st.error("无法找到 'Non-Commercial' 持仓数据列。")
-        st.write("请检查下方的所有列名，寻找类似 'Non-Comm' 的字段:")
-        st.write(list(df.columns)) # 打印出所有列名以便排查
-        st.stop()
-
-    # 计算净持仓
+    
+    # 5. 计算并清洗 (关键步骤：去重和排序)
     data['Net_Pos'] = data[long_col] - data[short_col]
     data['Date_Display'] = data[date_col]
     
-    return data.tail(52) # 只取最近一年
+    # ⚠️ 关键修复：去除同一日期的重复数据，并按日期严格排序
+    data = data.sort_values('Date_Display')
+    data = data.drop_duplicates(subset=['Date_Display'], keep='last')
+    
+    return data.tail(52) # 最近一年
 
-# --- 主程序 ---
-with st.spinner('正在获取数据并智能解析...'):
-    try:
-        raw_df = get_cftc_data()
-        
-        # 定义搜索关键词
-        data_gold = process_data(raw_df, ["GOLD", "COMMODITY"])
-        data_euro = process_data(raw_df, ["EURO FX", "CHICAGO"])
-        data_gbp  = process_data(raw_df, ["BRITISH POUND", "STERLING"])
-        
-    except Exception as e:
-        st.error(f"发生未知错误: {e}")
-        st.stop()
-
-# --- 绘图 ---
-def render_chart(data, title, color_code):
+# --- 🔥 全新升级的绘图引擎 ---
+def render_pro_chart(data, title, main_color):
     if data.empty:
-        st.warning(f"暂无数据: {title}")
+        st.warning(f"Waiting for data: {title}")
         return
 
+    # 准备数据
     last_date = data['Date_Display'].iloc[-1].strftime('%Y-%m-%d')
     current_net = data['Net_Pos'].iloc[-1]
+    prev_net = data['Net_Pos'].iloc[-2] if len(data) > 1 else current_net
+    change = current_net - prev_net
     
-    if len(data) > 1:
-        prev_net = data['Net_Pos'].iloc[-2]
-        delta = current_net - prev_net
-    else:
-        delta = 0
+    # 情绪判断
+    is_bullish = current_net > 0
+    sentiment_color = "#00FF7F" if is_bullish else "#FF4B4B" # 荧光绿 vs 亮红
+    sentiment_text = "Strong Bullish (强势看多)" if current_net > 0 else "Bearish (看空)"
+
+    # --- 布局：左边指标，右边图表 ---
+    col1, col2 = st.columns([1, 3])
     
-    sentiment_color = "green" if current_net > 0 else "red"
-    sentiment_text = "Bullish" if current_net > 0 else "Bearish"
+    with col1:
+        st.markdown(f"### {title.split(' ')[0]}") # 显示品种名
+        st.caption(f"Report Date: {last_date}")
+        
+        # 自定义大字体指标
+        st.metric(
+            label="Net Positions (净持仓)", 
+            value=f"{int(current_net):,}", 
+            delta=f"{int(change):,}"
+        )
+        
+        # 情绪卡片
+        st.markdown(f"""
+        <div style="margin-top: 20px; padding: 10px; border-radius: 5px; background-color: rgba(255,255,255,0.05); border-left: 5px solid {sentiment_color}">
+            <small style="color: #aaa">Market Sentiment</small><br>
+            <strong style="color: {sentiment_color}; font-size: 1.1em">{sentiment_text}</strong>
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.metric(label=f"Net Positions ({last_date})", value=f"{int(current_net):,}", delta=f"{int(delta):,}")
-    st.caption(f"Sentiment: :{sentiment_color}[{sentiment_text}]")
+    with col2:
+        fig = go.Figure()
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=data['Date_Display'], 
-        y=data['Net_Pos'],
-        mode='lines+markers',
-        name='Net Speculator',
-        line=dict(color=color_code, width=2),
-        fill='tozeroy'
-    ))
+        # 1. 0轴基准线 (参考线)
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
 
-    fig.update_layout(
-        title=title,
-        height=350,
-        margin=dict(l=20, r=20, t=40, b=20),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color="white"),
-        xaxis=dict(showgrid=False),
-        yaxis=dict(showgrid=True, gridcolor='#333')
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        # 2. 主数据线 (平滑曲线 + 渐变填充)
+        fig.add_trace(go.Scatter(
+            x=data['Date_Display'], 
+            y=data['Net_Pos'],
+            mode='lines', # 去掉markers让线条更干净，鼠标放上去会有显示
+            name='Net Positions',
+            line=dict(
+                color=main_color, 
+                width=3, 
+                shape='spline', # 🔥 关键：让线条变得圆润平滑
+                smoothing=1.3
+            ),
+            fill='tozeroy', # 填充到底部0轴
+            fillcolor=f"rgba{main_color[3:-1]}, 0.1)" if main_color.startswith('rgba') else main_color.replace(')', ', 0.1)').replace('rgb', 'rgba') 
+            # 注意：这里为了简单，你可以把颜色代码换成带透明度的，比如下面我有处理
+        ))
+        
+        # 更新颜色为带透明度的填充
+        if main_color == "#FFD700": fill_c = "rgba(255, 215, 0, 0.2)"
+        elif main_color == "#00d2ff": fill_c = "rgba(0, 210, 255, 0.2)"
+        else: fill_c = "rgba(235, 64, 52, 0.2)"
+        
+        fig.update_traces(fillcolor=fill_c)
 
-# --- 选项卡 ---
-tab1, tab2, tab3 = st.tabs(["Gold", "Euro", "GBP"])
+        fig.update_layout(
+            title=dict(text=f"{title} Trend", font=dict(size=14, color="#aaa")),
+            height=400,
+            margin=dict(l=0, r=20, t=30, b=0),
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            hovermode="x unified", # 鼠标移动时显示十字准星
+            xaxis=dict(
+                showgrid=False, 
+                title="",
+                type="date",
+                tickformat="%Y-%m-%d" # 强制显示日期格式
+            ),
+            yaxis=dict(
+                showgrid=True, 
+                gridcolor='#333', 
+                zeroline=False
+            )
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    
+    st.divider() # 分割线
 
-with tab1:
-    render_chart(data_gold, "Gold (XAUUSD) Net Positions", "#FFD700")
-with tab2:
-    render_chart(data_euro, "Euro (EURUSD) Net Positions", "#00d2ff")
-with tab3:
-    render_chart(data_gbp, "Pound (GBPUSD) Net Positions", "#eb4034")
+# --- 主程序 ---
+with st.spinner('Syncing w/ CFTC Servers...'):
+    df = get_cftc_data()
+    
+    # 获取数据
+    gold = process_data(df, ["GOLD", "COMMODITY"])
+    euro = process_data(df, ["EURO FX", "CHICAGO"])
+    gbp = process_data(df, ["BRITISH POUND", "STERLING"])
+
+# --- 渲染界面 (瀑布流式布局) ---
+render_pro_chart(gold, "Gold (XAU) / USD", "#FFD700")
+render_pro_chart(euro, "Euro (EUR) / USD", "#00d2ff")
+render_pro_chart(gbp, "Pound (GBP) / USD", "#eb4034")
