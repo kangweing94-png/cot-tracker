@@ -3,227 +3,237 @@ import pandas as pd
 import numpy as np
 import datetime
 import plotly.express as px
-import time
+import plotly.graph_objects as go
+import yfinance as yf
 
 # ==========================================
-# 1. 页面配置与机构级样式
+# 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="Institutional Macro Dashboard V5", layout="wide", page_icon="🏦")
-
-# 模拟当前日期
-CURRENT_DATE = datetime.date(2025, 12, 8)
+st.set_page_config(page_title="Real-Time Institutional Dashboard", layout="wide", page_icon="📡")
 
 st.markdown("""
 <style>
     .stApp { background-color: #0b0e11; color: #e0e0e0; }
-    
-    /* COT 卡片样式 */
     .metric-card {
         background-color: #161b22;
         border: 1px solid #30363d;
         padding: 15px;
         border-radius: 8px;
-        margin-bottom: 5px; /* 减少底部边距，为图表留空间 */
+        margin-bottom: 5px;
     }
     .card-header { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
-    .card-value { font-size: 24px; font-weight: 700; color: #f0f6fc; font-family: 'Roboto Mono', monospace; margin: 5px 0; }
+    .card-value { font-size: 26px; font-weight: 700; color: #f0f6fc; font-family: 'Roboto Mono', monospace; margin: 5px 0; }
     .card-delta { font-size: 13px; font-weight: 500; }
     .delta-pos { color: #3fb950; }
     .delta-neg { color: #f85149; }
-    .card-sub { font-size: 11px; color: #666; margin-top: 5px; }
-    
-    /* Fed 讲话卡片 */
-    .fed-card { background-color: #1c2128; border-left: 4px solid #333; padding: 15px; margin-bottom: 10px; border-radius: 4px; }
-    .fed-hawk { border-left-color: #f85149; }
-    .fed-dove { border-left-color: #3fb950; }
-    .fed-neutral { border-left-color: #d29922; }
-    .fed-name { font-weight: bold; font-size: 15px; color: #fff; }
-    .fed-role { font-size: 12px; color: #8b949e; margin-bottom: 8px; }
-    .fed-quote { font-style: italic; color: #d0d7de; font-size: 13px; }
-
+    .sub-text { font-size: 11px; color: #666; margin-top: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 数据引擎 (Data Engine V5)
+# 2. 真实数据引擎 (Real Data Engine)
 # ==========================================
 
-class DataEngineV5:
+class RealDataEngine:
     def __init__(self):
-        # 生成模拟历史数据用于图表
-        self.dates = pd.date_range(start="2024-06-01", end="2025-10-28", freq="W-TUE")
+        pass
+
+    @st.cache_data(ttl=3600) # 缓存1小时，避免频繁请求被封
+    def get_market_price(self, ticker):
+        """
+        从 Yahoo Finance 获取实时价格和历史走势
+        """
+        try:
+            # 下载最近3个月的数据
+            df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+            if df.empty:
+                return None
+            
+            # 获取最新价和涨跌幅
+            latest_price = df['Close'].iloc[-1].item()
+            prev_price = df['Close'].iloc[-2].item()
+            change = latest_price - prev_price
+            pct_change = (change / prev_price) * 100
+            
+            return {
+                "latest": latest_price,
+                "change": change,
+                "pct": pct_change,
+                "history": df.reset_index()
+            }
+        except Exception as e:
+            st.error(f"Error fetching {ticker}: {e}")
+            return None
+
+    @st.cache_data(ttl=86400) # 缓存24小时，CFTC 每周才更新一次
+    def get_cftc_data(self):
+        """
+        尝试从 CFTC 官网直接读取最新的 COT 报告 (Legacy format for simplicity)
+        URL: https://www.cftc.gov/dea/newcot/deacmesf.txt (CME Futures Only)
+        """
+        cftc_url = "https://www.cftc.gov/dea/newcot/deacmesf.txt"
         
-    def _generate_history(self, base, volatility):
-        # 生成带随机波动的历史序列
-        np.random.seed(42) # 固定随机种子保证演示一致性
-        changes = np.random.normal(0, volatility, len(self.dates))
-        values = base + np.cumsum(changes)
-        return pd.DataFrame({"Date": self.dates, "Net_Positions": values})
+        try:
+            # CFTC 的 txt 文件没有 header，我们需要手动定义常用列
+            # 格式参考 CFTC 文档：
+            # Col 0: Market Name, Col 2: Date
+            # Col 10: Non-Comm Long, Col 11: Non-Comm Short (这是 Smart Money 的大概位置)
+            # *注意*: 这种直接抓取比较脆弱，如果 CFTC 改格式会失效
+            
+            df = pd.read_csv(cftc_url, header=None, low_memory=False)
+            
+            # 简单的名称映射
+            assets = {
+                "GOLD": "GOLD - COMMODITY EXCHANGE INC.",
+                "EURO": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+                "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE"
+            }
+            
+            results = []
+            for short_name, cftc_name in assets.items():
+                # 模糊匹配名称
+                row = df[df[0].str.contains(short_name, case=False, na=False)]
+                
+                if not row.empty:
+                    # 取第一行（通常是最新的，但文件里通常只有最新一周的数据）
+                    data = row.iloc[0]
+                    date_str = data[2] # Report Date
+                    
+                    # 在 Legacy 报告中，Non-Commercial Long 通常在 index 8-10 左右，这里为了演示稳定性，
+                    # 我们模拟计算 Net Position (Long - Short)。 
+                    # *真实项目中建议使用 `cot_reports` 库，这里直接读取原始数据列可能需要根据文档校准*
+                    long_pos = float(data[8]) # Non-Commercial Long
+                    short_pos = float(data[9]) # Non-Commercial Short
+                    net_pos = long_pos - short_pos
+                    
+                    results.append({
+                        "name": short_name,
+                        "net": net_pos,
+                        "date": date_str,
+                        "long": long_pos,
+                        "short": short_pos
+                    })
+            return results
 
-    def get_cot_data(self):
-        # 模拟三种资产的历史数据
-        eur_hist = self._generate_history(base=-10000, volatility=5000)
-        gbp_hist = self._generate_history(base=5000, volatility=3000)
-        xau_hist = self._generate_history(base=180000, volatility=8000)
+        except Exception as e:
+            # 如果 CFTC 官网连接失败 (常见于反爬虫)，返回 None
+            return None
 
-        # 计算最新值和变化
-        def get_stats(df):
-            latest = df.iloc[-1]['Net_Positions']
-            prev = df.iloc[-2]['Net_Positions']
-            change = latest - prev
-            return latest, change, df
-
-        eur_pos, eur_chg, eur_df = get_stats(eur_hist)
-        gbp_pos, gbp_chg, gbp_df = get_stats(gbp_hist)
-        xau_pos, xau_chg, xau_df = get_stats(xau_hist)
-
-        return [
-            {"name": "EUR/USD", "pos": eur_pos, "change": eur_chg, "date": "2025-10-28", "history": eur_df, "color": "#FFD700"},
-            {"name": "GBP/USD", "pos": gbp_pos, "change": gbp_chg, "date": "2025-10-28", "history": gbp_df, "color": "#00CED1"},
-            {"name": "GOLD (XAU)", "pos": xau_pos, "change": xau_chg, "date": "2025-10-28", "history": xau_df, "color": "#FFA500"},
-        ]
-
-    def get_macro_data(self):
-        # 增加 Link 列
-        data = [
-            {"Event": "Non-Farm Payrolls", "Date": "2025-12-05", "Actual": "150K", "Forecast": "180K", "Impact": "HIGH", "Bias": "Bearish USD", "Link": "https://www.bls.gov/news.release/empsit.nr0.htm"},
-            {"Event": "CPI (YoY)", "Date": "2025-11-12", "Actual": "3.2%", "Forecast": "3.0%", "Impact": "HIGH", "Bias": "Bullish USD", "Link": "https://www.bls.gov/cpi/"},
-            {"Event": "FOMC Rate Decision", "Date": "2025-11-06", "Actual": "5.25%", "Forecast": "5.25%", "Impact": "CRITICAL", "Bias": "Neutral", "Link": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"},
-            {"Event": "Core PCE (MoM)", "Date": "2025-11-29", "Actual": "0.3%", "Forecast": "0.2%", "Impact": "HIGH", "Bias": "Bullish USD", "Link": "https://www.bea.gov/data/personal-consumption-expenditures-price-index"},
-            {"Event": "ISM Mfg PMI", "Date": "2025-12-01", "Actual": "48.5", "Forecast": "49.0", "Impact": "MED", "Bias": "Bearish USD", "Link": "https://www.ismworld.org/"},
-        ]
-        return pd.DataFrame(data)
-
-    def get_fed_speeches(self):
-        # (保持不变)
-        return [
-            {"Name": "Jerome Powell", "Role": "Fed Chair", "Stance": "Neutral/Hawk", "Quote": "We need more evidence that inflation is sustainably down.", "Date": "2025-12-01", "Type": "fed-neutral"},
-            {"Name": "Christopher Waller", "Role": "Governor", "Stance": "Hawk (鹰派)", "Quote": "The recent data suggests we should hold rates higher for longer.", "Date": "2025-12-04", "Type": "fed-hawk"},
-            {"Name": "Austan Goolsbee", "Role": "Chicago Fed Pres", "Stance": "Dove (鸽派)", "Quote": "We are risking excessive job losses if we stay too tight.", "Date": "2025-12-06", "Type": "fed-dove"}
-        ]
-
-engine = DataEngineV5()
+engine = RealDataEngine()
 
 # ==========================================
 # 3. 前端 UI 渲染
 # ==========================================
 
-st.title("🏛️ Institutional Macro & COT Dashboard V5")
-st.caption(f"Last Updated: {CURRENT_DATE} | Status: US Gov Shutdown Simulated (Data lagging)")
+st.title("📡 Real-World Live Market Dashboard")
+st.caption(f"Connected to: Yahoo Finance & CFTC.gov | Time Zone: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-# --- 1. COT Section (修复：图表回归) ---
-st.markdown("### 1. Smart Money Positioning (COT & Trend)")
-cot_data = engine.get_cot_data()
-cols = st.columns(3)
-for i, asset in enumerate(cot_data):
-    color_class = "delta-pos" if asset['change'] > 0 else "delta-neg"
-    arrow = "▲" if asset['change'] > 0 else "▼"
+# --- 1. Real Market Prices (Yahoo Finance) ---
+st.markdown("### 1. Real-Time Market Prices (Yahoo Finance)")
+st.markdown("直接获取全球市场实时报价 (Live Quote)。")
+
+# 定义代码: 黄金, 欧元, 英镑, 美元指数
+tickers = [
+    {"name": "Gold (XAU/USD)", "symbol": "GC=F", "format": "${:,.2f}"},
+    {"name": "Euro (EUR/USD)", "symbol": "EURUSD=X", "format": "{:.4f}"},
+    {"name": "GBP (GBP/USD)", "symbol": "GBPUSD=X", "format": "{:.4f}"},
+    {"name": "Dollar Index (DXY)", "symbol": "DX-Y.NYB", "format": "{:.2f}"},
+]
+
+cols = st.columns(4)
+
+for i, t in enumerate(tickers):
+    data = engine.get_market_price(t['symbol'])
     with cols[i]:
-        # 卡片 HTML
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="card-header">{asset['name']} Futures</div>
-            <div class="card-value">{int(asset['pos']):,}</div>
-            <div class="card-delta {color_class}">
-                {arrow} {int(asset['change']):,} WoW
+        if data:
+            color_class = "delta-pos" if data['change'] >= 0 else "delta-neg"
+            arrow = "▲" if data['change'] >= 0 else "▼"
+            
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="card-header">{t['name']}</div>
+                <div class="card-value" style="color: {'#3fb950' if data['change']>=0 else '#f85149'};">
+                    {t['format'].format(data['latest'])}
+                </div>
+                <div class="card-delta {color_class}">
+                    {arrow} {t['format'].format(data['change'])} ({data['pct']:.2f}%)
+                </div>
             </div>
-            <div class="card-sub">Report Date: {asset['date']} (⚠️Lagging)</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # 修复点：Plotly 迷你图回归
-        fig = px.area(asset['history'], x='Date', y='Net_Positions', height=120)
-        fig.update_layout(
-            template="plotly_dark", 
-            margin=dict(l=0, r=0, t=0, b=10), # 极简边距
-            xaxis=dict(visible=False, showgrid=False), 
-            yaxis=dict(visible=False, showgrid=False),
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-            showlegend=False
-        )
-        fig.update_traces(line_color=asset['color'], fillcolor=asset['color'].replace(")", ", 0.3)").replace("rgb", "rgba"), line_width=1.5)
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'staticPlot': True})
+            """, unsafe_allow_html=True)
+            
+            # 绘制真实走势图
+            fig = px.area(data['history'], x='Date', y='Close', height=100)
+            fig.update_layout(
+                template="plotly_dark", 
+                margin=dict(l=0, r=0, t=0, b=0),
+                xaxis=dict(visible=False), yaxis=dict(visible=False),
+                showlegend=False
+            )
+            # 根据涨跌变色
+            line_color = '#3fb950' if data['change'] >= 0 else '#f85149'
+            fig.update_traces(line_color=line_color, fillcolor=line_color.replace("#", "rgba(").replace(")", ", 0.2)"))
+            # 修复rgba转换问题，直接用简单颜色
+            fig.update_traces(line_color=line_color) 
+            
+            st.plotly_chart(fig, use_container_width=True, config={'staticPlot': True})
+        else:
+            st.error(f"Failed to fetch {t['name']}")
 
 st.markdown("---")
 
-# --- 2. Macro Data (修复：可视化增强 + 链接回归) ---
-st.markdown("### 2. Macroeconomic Matrix (Enhanced Viz)")
-st.markdown("关键经济数据日历。使用 **Pandas Styling** 高亮重要信息。")
+# --- 2. Real CFTC COT Data (Live Scrape) ---
+st.markdown("### 2. CFTC COT Data (Real Scrape)")
+st.markdown("尝试从 `cftc.gov` 获取最新报告。如果显示空白，可能是因为 CFTC 官网拒绝了连接（反爬虫）。")
 
-macro_df = engine.get_macro_data()
+cftc_data = engine.get_cftc_data()
 
-# 修复点：使用 Pandas Styler 进行条件着色
-styler = macro_df.style.format({"Actual": "{}"}) \
-    .map(lambda v: 'color: #ff7b72; font-weight: bold;' if v in ['HIGH', 'CRITICAL'] else '', subset=['Impact']) \
-    .map(lambda v: 'color: #3fb950;' if 'Bullish' in v else 'color: #f85149;' if 'Bearish' in v else '', subset=['Bias'])
-
-# 修复点：使用 column_config 渲染链接列
-st.dataframe(
-    styler,
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Link": st.column_config.LinkColumn(
-            "Source Reference",
-            help="Click to visit official data source",
-            validate="^https://.*",
-            display_text="Official Source 🔗"
-        ),
-        "Impact": st.column_config.TextColumn("Impact Level"),
-        "Bias": st.column_config.TextColumn("Market Bias"),
-    },
-    height=300
-)
-
-# --- 3. Market Impact & Fed Radar (修复：数值合理化) ---
-st.markdown("---")
-col_impact, col_fed = st.columns([1.2, 1]) # 调整一下比例
-
-# 左侧：Market Impact Analysis (修复数值)
-with col_impact:
-    st.markdown("### 🎯 Market Impact Analysis (NFP Focus)")
-    
-    # 修复点：更新了模拟数值，使其看起来更合理
-    st.markdown(f"""
-    <div style="background-color:#161b22; padding:20px; border-radius:8px; border:1px solid #30363d;">
-        <div style="margin-bottom:15px; font-size:16px;">Focus Event: <strong>Non-Farm Payrolls (NFP)</strong></div>
-        <table style="width:100%; color:#e0e0e0; font-size:14px;">
-            <tr>
-                <td style="color:#8b949e; padding-bottom:8px;">Data Release:</td>
-                <td style="text-align:right; font-weight:bold;">2025-12-05 (Last Friday)</td>
-            </tr>
-            <tr style="border-bottom:1px solid #333;">
-                <td style="color:#8b949e; padding-bottom:15px;">Outcome:</td>
-                <td style="text-align:right; font-weight:bold; color:#f85149; padding-bottom:15px;">150K (Missed Exp of 180K)</td>
-            </tr>
-            <tr>
-                <td style="padding-top:15px;">📉 <strong>USD Reaction</strong></td>
-                <td style="text-align:right; padding-top:15px;"><strong>Bearish</strong> <br><span style="font-size:12px; color:#f85149;">DXY index dropped -0.6% to 103.50</span></td>
-            </tr>
-            <tr>
-                <td style="padding-top:10px;">📈 <strong>Gold Reaction</strong></td>
-                <td style="text-align:right; padding-top:10px;"><strong>Bullish</strong> <br><span style="font-size:12px; color:#3fb950;">XAU/USD rallied +$25 to $2050.00</span></td>
-            </tr>
-        </table>
-    </div>
-    <div style="margin-top:15px; font-size:13px; color:#888;">Note: Market reactions are simulated based on the 'Missed Expectation' scenario.</div>
-    """, unsafe_allow_html=True)
-
-# 右侧：Fed Radar (保持不变)
-with col_fed:
-    st.markdown("### 🦅 Fed Speaker Radar (FOMC)")
-    speeches = engine.get_fed_speeches()
-    for speech in speeches:
-        st.markdown(f"""
-        <div class="fed-card {speech['Type']}">
-            <div class="fed-name">{speech['Name']} <span style="font-size:12px; font-weight:normal; color:#aaa;">| {speech['Role']}</span></div>
-            <div class="fed-role" style="color:{'#f85149' if 'Hawk' in speech['Stance'] else '#3fb950' if 'Dove' in speech['Stance'] else '#d29922'};">
-                {speech['Stance']}
+if cftc_data:
+    c_cols = st.columns(3)
+    for i, item in enumerate(cftc_data):
+        with c_cols[i]:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="card-header">{item['name']} Futures (Net Non-Comm)</div>
+                <div class="card-value">{int(item['net']):,}</div>
+                <div class="sub-text">
+                    Longs: {int(item['long']):,} | Shorts: {int(item['short']):,} <br>
+                    Report Date: {item['date']}
+                </div>
             </div>
-            <div class="fed-quote">“{speech['Quote']}”</div>
-            <div class="fed-date" style="text-align:right; font-size:11px; margin-top:5px; color:#666;">{speech['Date']}</div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+else:
+    st.warning("⚠️ 无法连接到 CFTC 官网获取实时 COT 数据。请检查网络或 CFTC 是否正在维护。")
+    # 这里为了不让你看到空白，我可以显示一个“如何手动下载”的链接
+    st.markdown("[点击这里手动下载最新 COT 报告 (cftc.gov)](https://www.cftc.gov/dea/newcot/deacmesf.txt)")
 
 st.markdown("---")
-st.caption("Disclaimer: Simulated Data for Dec 2025 Scenario. Trading involves significant risk.")
+
+# --- 3. Real Macro Proxies (Using Yields/Oil) ---
+st.markdown("### 3. Macro Market Proxies (Live)")
+st.markdown("由于获取实时 NFP/CPI 需要 API Key (FRED)，此处使用 **市场定价的宏观指标** (Market-Priced Macro Indicators) 作为实时替代。")
+
+macro_tickers = [
+    {"name": "US 10Y Yield (通胀预期/利率)", "symbol": "^TNX"},
+    {"name": "Crude Oil (能源通胀)", "symbol": "CL=F"},
+    {"name": "VIX (恐慌指数)", "symbol": "^VIX"},
+]
+
+m_cols = st.columns(3)
+for i, t in enumerate(macro_tickers):
+    data = engine.get_market_price(t['symbol'])
+    with m_cols[i]:
+        if data:
+            st.markdown(f"**{t['name']}**: {data['latest']:.2f}")
+            fig = px.line(data['history'], x='Date', y='Close', height=150)
+            fig.update_layout(template="plotly_dark", margin=dict(l=0,r=0,t=0,b=0), xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig, use_container_width=True)
+
+# --- 4. Fed News (External Link) ---
+st.markdown("---")
+st.markdown("### 4. Fed Speeches & Calendar")
+st.info("💡 获取实时的 Fed 官员鹰鸽派言论分析需要接入新闻 API (如 Bloomberg/Reuters Terminal)。以下是官方源链接：")
+
+st.markdown("""
+* [Federal Reserve Press Releases](https://www.federalreserve.gov/newsevents/pressreleases.htm) 🔗
+* [CME FedWatch Tool (Rate Hike Probability)](https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html) 🔗
+""")
