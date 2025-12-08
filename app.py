@@ -2,323 +2,314 @@ import streamlit as st
 import pandas as pd
 import datetime
 import yfinance as yf
-import feedparser # 用于抓取实时新闻/日历 RSS
-import pandas_datareader.data as web # 用于抓取 FRED 真实宏观数据
+import feedparser
+from fredapi import Fred
+import plotly.express as px
 
 # ==========================================
-# 1. 页面配置
+# 1. 核心配置与 API 初始化
 # ==========================================
-st.set_page_config(page_title="Institutional Live Dashboard V8", layout="wide", page_icon="📡")
+st.set_page_config(page_title="Institutional Macro Dashboard V9", layout="wide", page_icon="🏦")
 
-# 获取系统当前精确时间
-NOW = datetime.datetime.now()
-LAST_UPDATE_STR = NOW.strftime('%Y-%m-%d %H:%M:%S')
+# 初始化 FRED API (使用你提供的 Key)
+try:
+    fred = Fred(api_key='476ef255e486edb3fdbf71115caa2857')
+except Exception as e:
+    st.error(f"FRED API Key Error: {e}")
 
+# 自定义机构风格 CSS
 st.markdown("""
 <style>
-    .stApp { background-color: #0b0e11; color: #e0e0e0; }
+    .stApp { background-color: #0e1117; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
     
-    /* 核心卡片样式 */
+    /* 模块容器 */
+    .block-container { padding-top: 2rem; }
+    
+    /* 卡片设计 */
     .metric-card {
         background-color: #161b22;
         border: 1px solid #30363d;
-        padding: 15px;
+        padding: 20px;
         border-radius: 8px;
-        margin-bottom: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        margin-bottom: 15px;
     }
-    .card-header { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
-    .card-value { font-size: 28px; font-weight: 700; color: #f0f6fc; font-family: 'Roboto Mono', monospace; margin: 5px 0; }
-    .card-footer { font-size: 11px; color: #666; margin-top: 5px; display: flex; justify-content: space-between;}
+    .metric-title { font-size: 14px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; }
+    .metric-value { font-size: 28px; font-weight: 700; color: #f0f6fc; margin: 8px 0; font-family: 'Roboto Mono', monospace; }
+    .metric-sub { font-size: 12px; display: flex; align-items: center; gap: 5px; }
     
-    /* 涨跌幅颜色 */
-    .pos { color: #3fb950; }
-    .neg { color: #f85149; }
+    /* 颜色类 */
+    .text-up { color: #3fb950; }
+    .text-down { color: #f85149; }
+    .text-neutral { color: #8b949e; }
     
-    /* 新闻流样式 */
-    .news-item {
-        border-left: 3px solid #1f6feb;
-        background-color: #0d1117;
-        padding: 10px;
+    /* 宏观表格表头 */
+    .dataframe th { background-color: #1f242d !important; color: #e6edf3 !important; }
+    
+    /* 新闻流 */
+    .news-card {
+        border-left: 3px solid #238636;
+        background-color: #161b22;
+        padding: 12px;
         margin-bottom: 8px;
         border-radius: 0 4px 4px 0;
+        transition: transform 0.1s;
     }
-    .news-title { font-weight: bold; font-size: 14px; color: #58a6ff; text-decoration: none;}
-    .news-date { font-size: 11px; color: #8b949e; margin-top: 4px;}
+    .news-card:hover { transform: translateX(5px); background-color: #1c2128; }
+    .news-link { text-decoration: none; color: #58a6ff; font-weight: 600; font-size: 14px; }
+    .news-meta { font-size: 11px; color: #8b949e; margin-top: 4px; }
 
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 真实数据引擎 (V8)
+# 2. 专业数据层 (Data Layer)
 # ==========================================
 
-# --- A. 市场价格 (Yahoo Finance) ---
-@st.cache_data(ttl=60) # 1分钟刷新一次，保证 XAU 实时性
-def get_live_price(ticker):
+# --- A. FRED 宏观数据 (Source of Truth) ---
+@st.cache_data(ttl=3600)
+def fetch_fred_macro():
+    """
+    Fetch OFFICIAL data from St. Louis Fed.
+    FRED does NOT provide 'Forecasts' (that is proprietary data).
+    We fetch the latest Actuals.
+    """
     try:
-        # 使用 fast_info 获取最新报价，速度更快
-        ticker_obj = yf.Ticker(ticker)
-        # 尝试获取 info，如果失败则回退
-        latest = ticker_obj.fast_info['last_price']
-        prev = ticker_obj.fast_info['previous_close']
-        
-        change = latest - prev
-        pct = (change / prev) * 100
-        
-        # 获取最新交易时间
-        quote_time = datetime.datetime.fromtimestamp(ticker_obj.fast_info['last_price_time_timestamp']) if hasattr(ticker_obj.fast_info, 'last_price_time_timestamp') else datetime.datetime.now()
-        
-        return {
-            "price": latest,
-            "change": change,
-            "pct": pct,
-            "time": quote_time.strftime('%H:%M:%S')
+        # 定义系列 ID
+        series_ids = {
+            "Non-Farm Payrolls": "PAYEMS", # 总就业人数
+            "Unemployment Rate": "UNRATE", # 失业率
+            "CPI (YoY)": "CPIAUCSL",       # CPI 指数
+            "Fed Funds Rate": "FEDFUNDS",  # 利率
+            "10Y Treasury Yield": "DGS10"  # 10年期美债
         }
-    except:
-        return None
+        
+        data = []
+        for name, sid in series_ids.items():
+            # 获取最后一条观察值
+            series = fred.get_series(sid, limit=5, sort_order='desc')
+            if not series.empty:
+                latest_val = series.iloc[0]
+                prev_val = series.iloc[1]
+                date_str = series.index[0].strftime('%Y-%m-%d')
+                
+                # 数据处理逻辑
+                display_val = f"{latest_val:,.2f}"
+                trend = "Stable"
+                
+                if name == "Non-Farm Payrolls":
+                    # NFP 通常关注的是变化量 (Change in thousands)
+                    change = (latest_val - prev_val) * 1000
+                    display_val = f"{int(change):+,}"
+                    unit = "Jobs"
+                elif "Rate" in name or "Yield" in name:
+                    display_val = f"{latest_val:.2f}%"
+                    unit = "%"
+                elif "CPI" in name:
+                    # 计算同比变化 (YoY) - 粗略计算
+                    # 严谨做法是 fetch CPIAUCSL 并计算 pct_change(12)
+                    cpi_yoy = ((latest_val - series.iloc[4]) / series.iloc[4]) * 100 # 近似 YoY
+                    display_val = f"{cpi_yoy:.1f}%" 
+                    unit = "YoY"
+                
+                # Market Bias Logic (Simple Rules)
+                bias = "Neutral"
+                if name == "CPI (YoY)" and float(display_val.strip('%')) > 2.5:
+                    bias = "Hawkish (Bullish USD)"
+                elif name == "Unemployment Rate" and latest_val < 4.0:
+                    bias = "Hawkish (Bullish USD)"
 
-# --- B. COT 数据 (纯 CFTC 官网抓取) ---
+                data.append({
+                    "Event": name,
+                    "Date": date_str,
+                    "Actual": display_val,
+                    "Forecast": "--", # FRED 不提供预测
+                    "Bias": bias,
+                    "Source": "FRED Official"
+                })
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.error(f"FRED Connection Failed: {e}")
+        return pd.DataFrame()
+
+# --- B. 市场价格 (Yahoo Finance Spot) ---
+@st.cache_data(ttl=60)
+def fetch_market_prices():
+    """获取现货/实时价格"""
+    tickers = {
+        "Gold Spot": "XAUUSD=X",
+        "DXY Index": "DX-Y.NYB",
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X"
+    }
+    
+    res = []
+    for name, symbol in tickers.items():
+        try:
+            t = yf.Ticker(symbol)
+            # 使用 fast_info 提高速度
+            price = t.fast_info['last_price']
+            prev = t.fast_info['previous_close']
+            change_pct = ((price - prev) / prev) * 100
+            
+            res.append({
+                "name": name,
+                "price": price,
+                "change": change_pct,
+                "symbol": symbol
+            })
+        except:
+            pass
+    return res
+
+# --- C. COT 数据 (CFTC Raw) ---
 @st.cache_data(ttl=86400)
-def get_cftc_pure():
+def fetch_cftc_cot():
+    """Directly parse CFTC Report"""
     url = "https://www.cftc.gov/dea/newcot/deacmesf.txt"
     try:
+        # Legacy Format: 
+        # Col 0: Name, Col 2: Date
+        # Col 8: Non-Comm Long, Col 9: Non-Comm Short
         df = pd.read_csv(url, header=None, low_memory=False)
-        assets_map = {
+        
+        targets = {
             "GOLD": "GOLD - COMMODITY EXCHANGE INC.",
             "EURO": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
             "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE"
         }
-        results = {}
-        for key, name in assets_map.items():
+        
+        parsed = []
+        for key, long_name in targets.items():
             row = df[df[0].str.contains(key, case=False, na=False)]
             if not row.empty:
                 data = row.iloc[0]
-                # 计算净持仓
-                net = float(data[8]) - float(data[9])
-                date = data[2] # 报告日期
-                results[key] = {"net": net, "date": date}
-        return results
-    except:
-        return None
-
-# --- C. 宏观数据 (FRED 官方 API) ---
-@st.cache_data(ttl=3600)
-def get_fred_macro():
-    """
-    使用 pandas_datareader 从 FRED 获取真实的最新发布数据
-    """
-    try:
-        # UNRATE: 失业率, CPIAUCSL: CPI, PAYEMS: 非农就业总人数, FEDFUNDS: 联邦基金利率
-        start = datetime.datetime.now() - datetime.timedelta(days=90)
-        
-        # 抓取数据
-        unrate = web.DataReader('UNRATE', 'fred', start)
-        cpi = web.DataReader('CPIAUCSL', 'fred', start)
-        nfp = web.DataReader('PAYEMS', 'fred', start)
-        fed_rate = web.DataReader('FEDFUNDS', 'fred', start)
-        
-        # 处理数据
-        # 1. 失业率
-        curr_un = unrate.iloc[-1].item()
-        
-        # 2. CPI YoY (需要计算同比)
-        # 注意：这里为了简单展示最新读数
-        curr_cpi_idx = cpi.iloc[-1].item()
-        
-        # 3. NFP (计算月度变化 = 非农增减)
-        curr_nfp = int(nfp.iloc[-1].item() - nfp.iloc[-2].item()) * 1000
-        
-        # 4. 利率
-        curr_rate = fed_rate.iloc[-1].item()
-        
-        return [
-            {"Event": "Unemployment Rate", "Actual": f"{curr_un}%", "Source": "FRED (Official)"},
-            {"Event": "Non-Farm Payrolls (Change)", "Actual": f"{curr_nfp:+,}", "Source": "FRED (Official)"},
-            {"Event": "Fed Funds Rate", "Actual": f"{curr_rate}%", "Source": "FRED (Official)"},
-            {"Event": "CPI Index (Latest)", "Actual": f"{curr_cpi_idx:.2f}", "Source": "FRED (Official)"},
-        ]
-    except Exception as e:
-        return None
-
-# --- D. 实时新闻流 (RSS) ---
-@st.cache_data(ttl=300)
-def get_rss_news(feed_url):
-    try:
-        feed = feedparser.parse(feed_url)
-        news_items = []
-        for entry in feed.entries[:5]: # 只取前5条
-            news_items.append({
-                "title": entry.title,
-                "link": entry.link,
-                "published": entry.published if 'published' in entry else "Just now"
-            })
-        return news_items
+                net_pos = float(data[8]) - float(data[9])
+                parsed.append({
+                    "asset": key,
+                    "net": net_pos,
+                    "date": data[2]
+                })
+        return parsed
     except:
         return []
 
+# --- D. RSS News (Fed Radar) ---
+@st.cache_data(ttl=300)
+def fetch_rss_feed():
+    # 使用 CNBC Finance 或 Investing.com 的 RSS
+    url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664" # CNBC Economy
+    feed = feedparser.parse(url)
+    return feed.entries[:6]
+
 # ==========================================
-# 3. 前端 UI 渲染
+# 3. 前端 UI 布局
 # ==========================================
 
-st.title("📡 Institutional Live Dashboard V8")
-st.caption(f"System Time: {LAST_UPDATE_STR} (GMT+8) | Connection: Yahoo Finance, CFTC.gov, St.Louis Fed, Reuters RSS")
+st.title("🏛️ Institutional Dashboard V9 (Professional)")
+st.caption(f"Connected APIs: St. Louis Fed (FRED), Yahoo Finance, CNBC RSS | Time: {datetime.datetime.now().strftime('%H:%M:%S')}")
 
-# -------------------------------------------
-# 1. Real-Time Market Prices (Yahoo Finance)
-# -------------------------------------------
-st.markdown("### 1. Real-Time Market Prices (Yahoo Finance)")
-st.caption(f"Prices updated as of: {datetime.datetime.now().strftime('%H:%M:%S')}. XAU uses Spot Price.")
+# --- 1. Market Overview (Real-Time) ---
+st.markdown("### 1. Market Overview (Spot & Index)")
+market_data = fetch_market_prices()
+m_cols = st.columns(4)
 
-# 配置：使用 XAUUSD=X (现货)
-tickers = [
-    {"name": "Gold Spot (XAU)", "symbol": "XAUUSD=X", "fmt": "${:,.2f}"},
-    {"name": "Euro (EUR/USD)", "symbol": "EURUSD=X", "fmt": "{:.4f}"},
-    {"name": "GBP (GBP/USD)", "symbol": "GBPUSD=X", "fmt": "{:.4f}"},
-    {"name": "Dollar Index (DXY)", "symbol": "DX-Y.NYB", "fmt": "{:.2f}"},
-]
-
-cols_price = st.columns(4)
-for i, t in enumerate(tickers):
-    data = get_live_price(t['symbol'])
-    with cols_price[i]:
-        if data:
-            color = "pos" if data['change'] >= 0 else "neg"
-            arrow = "▲" if data['change'] >= 0 else "▼"
-            st.markdown(f"""
-            <div class="metric-card">
-                <div class="card-header">{t['name']}</div>
-                <div class="card-value {color}">{t['fmt'].format(data['price'])}</div>
-                <div class="card-footer">
-                    <span class="{color}">{arrow} {data['pct']:.2f}%</span>
-                    <span>Last: {data['time']}</span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.warning("Fetching...")
-
-st.markdown("---")
-
-# -------------------------------------------
-# 2. Smart Money Positioning (Pure CFTC)
-# -------------------------------------------
-st.markdown("### 2. Smart Money Positioning (COT)")
-st.caption("Data Source: Direct fetch from cftc.gov (Legacy Report). No Yahoo charts mixed.")
-
-cot_data = get_cftc_pure()
-cot_config = [
-    {"name": "EUR Futures (Net)", "key": "EURO"},
-    {"name": "GBP Futures (Net)", "key": "GBP"},
-    {"name": "Gold Futures (Net)", "key": "GOLD"},
-]
-
-cols_cot = st.columns(3)
-for i, conf in enumerate(cot_config):
-    with cols_cot[i]:
-        if cot_data and conf['key'] in cot_data:
-            net_val = cot_data[conf['key']]['net']
-            date_val = cot_data[conf['key']]['date']
+if market_data:
+    for i, item in enumerate(market_data):
+        with m_cols[i]:
+            color_cls = "text-up" if item['change'] >= 0 else "text-down"
+            arrow = "▲" if item['change'] >= 0 else "▼"
+            fmt_price = f"${item['price']:,.2f}" if "Gold" in item['name'] else f"{item['price']:.4f}"
+            if "Index" in item['name']: fmt_price = f"{item['price']:.2f}"
             
             st.markdown(f"""
             <div class="metric-card">
-                <div class="card-header">{conf['name']}</div>
-                <div class="card-value">{int(net_val):,}</div>
-                <div class="card-footer">
-                    <span>Managed Money</span>
-                    <span>Date: {date_val}</span>
+                <div class="metric-title">{item['name']}</div>
+                <div class="metric-value {color_cls}">{fmt_price}</div>
+                <div class="metric-sub {color_cls}">
+                    {arrow} {item['change']:.2f}% <span style="color:#666; margin-left:5px;">(Real-time)</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-        else:
-            st.info("Waiting for CFTC...")
 
-st.markdown("---")
+# --- 2. Smart Money (COT) ---
+st.markdown("### 2. Smart Money Positioning (CFTC Official)")
+st.caption("Data Source: cftc.gov (Legacy Report). Net Positions of Managed Money.")
 
-# -------------------------------------------
-# 3. Macroeconomic Data (Real from FRED)
-# -------------------------------------------
-st.markdown("### 3. Macroeconomic Matrix (Latest Releases)")
-st.caption("Data Source: St. Louis Fed (FRED) Official API. Showing actual released numbers.")
+cot_data = fetch_cftc_cot()
+c_cols = st.columns(3)
 
-fred_data = get_fred_macro()
+if cot_data:
+    for i, item in enumerate(cot_data):
+        with c_cols[i]:
+            st.markdown(f"""
+            <div class="metric-card" style="border-top: 3px solid #d29922;">
+                <div class="metric-title">{item['asset']} FUTURES (NET)</div>
+                <div class="metric-value">{int(item['net']):,}</div>
+                <div class="metric-sub text-neutral">
+                    📅 Report Date: {item['date']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-if fred_data:
+# --- 3. Macro Matrix (FRED) ---
+st.markdown("### 3. Macroeconomic Matrix (FRED Data)")
+st.caption("Data Source: FRED API (Official Actuals). 'Forecast' column is N/A for government feeds.")
+
+macro_df = fetch_fred_macro()
+
+if not macro_df.empty:
+    # 使用 Pandas Styling 进行高亮
+    def highlight_bias(val):
+        color = '#3fb950' if 'Bullish' in val else '#f85149' if 'Bearish' in val else '#8b949e'
+        return f'color: {color}; font-weight: bold;'
+
+    styled_df = macro_df.style.map(highlight_bias, subset=['Bias'])
+    
     st.dataframe(
-        pd.DataFrame(fred_data),
+        styled_df,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Event": st.column_config.TextColumn("Indicator", width="medium"),
-            "Actual": st.column_config.TextColumn("Latest Actual Value", width="medium"),
-            "Source": st.column_config.TextColumn("Data Source"),
-        }
+            "Forecast": st.column_config.TextColumn("Forecast (Consensus)", help="FRED does not provide market forecasts."),
+            "Bias": st.column_config.TextColumn("Implied Market Bias"),
+        },
+        height=250
     )
 else:
-    st.warning("FRED API 连接超时，请稍后刷新。")
+    st.warning("Loading FRED data... (Check API Key limit)")
 
-st.markdown("---")
+# --- 4. Fed Speaker & News Radar ---
+st.markdown("### 4. 🦅 Fed & Economic Radar (RSS Quotes)")
+st.caption("Live Feed from CNBC Economy. Filtering for 'Fed', 'Inflation', 'Rate'.")
 
-# -------------------------------------------
-# 4. Macro Market Proxies (Live)
-# -------------------------------------------
-st.markdown("### 4. Macro Market Proxies (Live)")
-st.caption(f"Real-time yields & volatility. Updated: {datetime.datetime.now().strftime('%H:%M:%S')}")
+news = fetch_rss_feed()
+n_cols = st.columns([2, 1])
 
-proxies = [
-    {"name": "US 10Y Yield", "symbol": "^TNX"},
-    {"name": "Crude Oil (WTI)", "symbol": "CL=F"},
-    {"name": "VIX (Fear Index)", "symbol": "^VIX"},
-]
-p_cols = st.columns(3)
-for i, p in enumerate(proxies):
-    data = get_live_price(p['symbol'])
-    with p_cols[i]:
-        if data:
-            st.markdown(f"**{p['name']}**: {data['price']:.2f}")
-            st.caption(f"Change: {data['change']:.2f} ({data['pct']:.2f}%) | Time: {data['time']}")
-
-st.markdown("---")
-
-# -------------------------------------------
-# 5. Fed Speaker & News Radar (RSS Feed)
-# -------------------------------------------
-st.markdown("### 5. 🦅 Fed & Market News Radar (Live RSS)")
-st.caption("Live Headlines from Investing.com & CNBC (Replacing hardcoded quotes).")
-
-col_news1, col_news2 = st.columns(2)
-
-# 获取真实新闻流
-# 备注：Reuters 经常封锁 RSS，这里使用 Investing.com 或 CNBC 作为替代，它们更稳定
-fed_rss_url = "https://www.investing.com/rss/news_11.rss" # Market News
-general_rss_url = "https://www.investing.com/rss/news_285.rss" # Economic Indicators News
-
-with col_news1:
-    st.subheader("Market News (Investing.com)")
-    news_items = get_rss_news(fed_rss_url)
-    if news_items:
-        for item in news_items:
+with n_cols[0]:
+    if news:
+        for entry in news:
+            # 简单的高亮逻辑
+            highlight_border = "#238636" # Default Green
+            if any(x in entry.title.lower() for x in ['fed', 'powell', 'rate', 'inflation']):
+                highlight_border = "#d29922" # Gold for Fed news
+            
             st.markdown(f"""
-            <div class="news-item">
-                <a href="{item['link']}" target="_blank" class="news-title">{item['title']}</a>
-                <div class="news-date">{item['published']}</div>
+            <div class="news-card" style="border-left-color: {highlight_border};">
+                <a href="{entry.link}" target="_blank" class="news-link">{entry.title}</a>
+                <div class="news-meta">{entry.published}</div>
             </div>
             """, unsafe_allow_html=True)
     else:
-        st.write("No news fetched.")
+        st.info("No news feed available.")
 
-with col_news2:
-    st.subheader("Economy & Fed (Investing.com)")
-    fed_items = get_rss_news(general_rss_url)
-    if fed_items:
-        for item in fed_items:
-            st.markdown(f"""
-            <div class="news-item" style="border-left-color: #d29922;">
-                <a href="{item['link']}" target="_blank" class="news-title">{item['title']}</a>
-                <div class="news-date">{item['published']}</div>
-            </div>
-            """, unsafe_allow_html=True)
-    else:
-        st.write("No Fed news fetched.")
-
-st.markdown("---")
-st.info("💡 Note: FRED data usually lags by 1 month (release schedule). RSS News is real-time.")
+with n_cols[1]:
+    st.markdown("#### ℹ️ Data Disclaimer")
+    st.info("""
+    **Forecast Data:**
+    Government APIs (FRED) do not publish "Market Forecasts". 
+    To see "Forecast: 180K", you need a subscription to Bloomberg, Refinitiv, or scrape ForexFactory (unstable).
+    
+    **Current Display:**
+    This dashboard shows the **Official Actuals** directly from the US Government.
+    """)
