@@ -1,38 +1,29 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import datetime
 import yfinance as yf
 import feedparser
 from fredapi import Fred
 import requests
 import io
-import re
 
 # ==========================================
-# 1. 核心配置 & Fed 立场数据库
+# 1. 核心配置
 # ==========================================
-st.set_page_config(page_title="Institutional Dashboard V10", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="Institutional Dashboard V11", layout="wide", page_icon="🏦")
 
-# 你的 FRED API Key
+# API Keys & Config
 FRED_KEY = '476ef255e486edb3fdbf71115caa2857'
-
-# Fed 官员立场静态数据库 (用于匹配 RSS)
-FED_ROSTER = {
-    "Powell": {"role": "Chair", "stance": "Neutral (中立)", "color": "#d29922"},
-    "Waller": {"role": "Governor", "stance": "Hawk (鹰派) 🦅", "color": "#f85149"},
-    "Bowman": {"role": "Governor", "stance": "Hawk (鹰派) 🦅", "color": "#f85149"},
-    "Kashkari": {"role": "Minneapolis Pres", "stance": "Hawk (鹰派) 🦅", "color": "#f85149"},
-    "Goolsbee": {"role": "Chicago Pres", "stance": "Dove (鸽派) 🕊️", "color": "#3fb950"},
-    "Daly": {"role": "SF Pres", "stance": "Neutral (中立)", "color": "#8b949e"},
-    "Logan": {"role": "Dallas Pres", "stance": "Hawk (鹰派) 🦅", "color": "#f85149"},
-    "Bostic": {"role": "Atlanta Pres", "stance": "Dove (鸽派) 🕊️", "color": "#3fb950"}
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
 
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; }
     
-    /* 卡片通用样式 */
+    /* 卡片样式 */
     .metric-card {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -42,268 +33,266 @@ st.markdown("""
     }
     .metric-label { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
     .metric-val { font-size: 28px; font-weight: 700; color: #f0f6fc; font-family: 'Roboto Mono', monospace; margin: 8px 0; }
-    .metric-sub { font-size: 11px; color: #666; }
+    .metric-sub { font-size: 11px; display: flex; justify-content: space-between; color: #666; }
     
-    /* Fed 语录卡片 */
-    .fed-quote-card {
-        background-color: #1c2128;
-        border-left: 4px solid #333;
-        padding: 15px;
-        margin-bottom: 10px;
-        border-radius: 4px;
-    }
-    .quote-text { font-style: italic; color: #d0d7de; font-size: 15px; margin: 8px 0; line-height: 1.4; }
-    .speaker-name { font-weight: bold; font-size: 14px; color: #fff; }
-    .speaker-role { font-size: 11px; color: #8b949e; margin-left: 5px; }
-    .stance-tag { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #21262d; border: 1px solid #30363d; margin-left: 8px; font-weight: bold;}
+    /* 颜色标识 */
+    .status-real { color: #3fb950; font-weight: bold; }
+    .status-sim { color: #d29922; font-weight: bold; }
+    .pos { color: #3fb950; }
+    .neg { color: #f85149; }
 
+    /* Fed 新闻流 */
+    .fed-card {
+        border-left: 3px solid #238636;
+        background-color: #1c2128;
+        padding: 12px;
+        margin-bottom: 8px;
+        border-radius: 0 4px 4px 0;
+    }
+    .news-link { text-decoration: none; color: #58a6ff; font-weight: 600; font-size: 14px; }
+    .news-meta { font-size: 11px; color: #8b949e; margin-top: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 专业数据引擎 (修复版)
+# 2. 双保险数据引擎 (Hybrid Engine)
 # ==========================================
 
-# --- A. 修复 CFTC (增加 User-Agent 伪装) ---
-@st.cache_data(ttl=86400)
-def fetch_cftc_robust():
-    """
-    使用 requests 伪装浏览器请求，解决 403 Forbidden 问题
-    """
-    url = "https://www.cftc.gov/dea/newcot/deacmesf.txt"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            return None
-        
-        # 将文本内容转换为 pandas 可读的流
-        csv_data = io.StringIO(response.text)
-        
-        # CFTC Legacy Format (无表头):
-        # Col 0: Name, Col 2: Date, Col 8: Non-Comm Long, Col 9: Non-Comm Short
-        df = pd.read_csv(csv_data, header=None, low_memory=False)
-        
-        targets = {
-            "GOLD": "GOLD - COMMODITY EXCHANGE INC.",
-            "EURO": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
-            "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE"
-        }
-        
-        parsed = []
-        for key, long_name in targets.items():
-            # 模糊匹配
-            row = df[df[0].str.contains(key, case=False, na=False)]
-            if not row.empty:
-                data = row.iloc[0]
-                net_pos = float(data[8]) - float(data[9])
-                date_str = data[2] # 格式通常是 YYYY-MM-DD
-                parsed.append({
-                    "asset": key,
-                    "net": net_pos,
-                    "date": date_str
-                })
-        return parsed
-    except Exception as e:
-        print(f"CFTC Error: {e}")
-        return None
+class HybridDataEngine:
+    def __init__(self):
+        pass
 
-# --- B. 修复 FRED (强制获取最新非空值) ---
+    # --- 方案 A: 尝试抓取真实 CFTC 数据 ---
+    def _fetch_real_cftc(self):
+        url = "https://www.cftc.gov/dea/newcot/deacmesf.txt"
+        try:
+            # 设置 3 秒超时，避免卡住
+            response = requests.get(url, headers=headers, timeout=3)
+            if response.status_code != 200: return None
+            
+            csv_data = io.StringIO(response.text)
+            df = pd.read_csv(csv_data, header=None, low_memory=False)
+            
+            targets = {
+                "GOLD": "GOLD - COMMODITY EXCHANGE INC.",
+                "EURO": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+                "GBP": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE"
+            }
+            
+            parsed = []
+            for key, long_name in targets.items():
+                row = df[df[0].str.contains(key, case=False, na=False)]
+                if not row.empty:
+                    data = row.iloc[0]
+                    parsed.append({
+                        "asset": key,
+                        "net": float(data[8]) - float(data[9]),
+                        "date": data[2],
+                        "source_type": "REAL"
+                    })
+            return parsed
+        except:
+            return None
+
+    # --- 方案 B: 生成模拟数据 (你提供的算法) ---
+    def _generate_mock_cftc(self):
+        # 模拟日期：今天
+        sim_date = datetime.date.today().strftime("%Y-%m-%d")
+        
+        # 基于真实市场范围的随机波动
+        return [
+            {
+                "asset": "GOLD",
+                "net": 195000 + np.random.randint(-5000, 5000),
+                "date": sim_date,
+                "source_type": "SIMULATED"
+            },
+            {
+                "asset": "EURO",
+                "net": -22000 + np.random.randint(-2000, 2000),
+                "date": sim_date,
+                "source_type": "SIMULATED"
+            },
+            {
+                "asset": "GBP",
+                "net": 12000 + np.random.randint(-1000, 1000),
+                "date": sim_date,
+                "source_type": "SIMULATED"
+            }
+        ]
+
+    # --- 主调用：智能切换 ---
+    def get_cot_data(self):
+        # 1. 优先尝试真实数据
+        data = self._fetch_real_cftc()
+        if data:
+            return data
+        
+        # 2. 失败则启用模拟数据
+        return self._generate_mock_cftc()
+
+# 初始化引擎
+hybrid_engine = HybridDataEngine()
+
+# ==========================================
+# 3. 其他数据函数 (Yahoo, FRED, RSS)
+# ==========================================
+
+@st.cache_data(ttl=60)
+def fetch_live_prices():
+    tickers = {
+        "Gold Spot": "XAUUSD=X",
+        "DXY Index": "DX-Y.NYB",
+        "EUR/USD": "EURUSD=X",
+        "GBP/USD": "GBPUSD=X"
+    }
+    res = []
+    for name, sym in tickers.items():
+        try:
+            t = yf.Ticker(sym)
+            curr = t.fast_info['last_price']
+            prev = t.fast_info['previous_close']
+            chg_pct = ((curr - prev)/prev)*100
+            res.append({"name": name, "price": curr, "pct": chg_pct})
+        except:
+            pass
+    return res
+
 @st.cache_data(ttl=3600)
-def fetch_fred_latest():
+def fetch_fred_official():
     try:
         fred = Fred(api_key=FRED_KEY)
-        
-        # 指标定义
         indicators = [
-            {"name": "Non-Farm Payrolls", "id": "PAYEMS", "is_change": True, "unit": "Jobs"},
-            {"name": "Unemployment Rate", "id": "UNRATE", "is_change": False, "unit": "%"},
-            {"name": "CPI (YoY)", "id": "CPIAUCSL", "is_change": "yoy", "unit": "%"},
-            {"name": "Fed Funds Rate", "id": "FEDFUNDS", "is_change": False, "unit": "%"},
-            {"name": "10Y Treasury Yield", "id": "DGS10", "is_change": False, "unit": "%"}
+            {"name": "Non-Farm Payrolls", "id": "PAYEMS", "change": True},
+            {"name": "Unemployment Rate", "id": "UNRATE", "change": False},
+            {"name": "CPI (YoY)", "id": "CPIAUCSL", "change": "yoy"},
+            {"name": "Fed Funds Rate", "id": "FEDFUNDS", "change": False},
         ]
-        
-        data_rows = []
-        
+        rows = []
         for ind in indicators:
-            # 获取最近 13 个月的数据，确保能算同比
-            series = fred.get_series(ind['id'], sort_order='desc', limit=24)
+            series = fred.get_series(ind['id'], sort_order='desc', limit=13)
             if series.empty: continue
             
-            # 取最新的有效日期和数值
-            latest_date = series.index[0]
-            latest_val = series.iloc[0]
+            val = series.iloc[0]
+            date = series.index[0].strftime('%Y-%m-%d')
+            disp = ""
             
-            display_val = ""
-            
-            if ind['is_change'] == True:
-                # 计算 NFP 变化 (最新值 - 上个月值) * 1000
-                prev_val = series.iloc[1]
-                change = (latest_val - prev_val) * 1000
-                display_val = f"{int(change):+,}"
-            elif ind['is_change'] == 'yoy':
-                # CPI 同比：(今年值 - 去年同月值) / 去年同月值
-                # 注意：sort_order='desc', 所以 index 0 是最新，index 12 是去年的
-                if len(series) > 12:
-                    val_now = series.iloc[0]
-                    val_last_year = series.iloc[12]
-                    yoy = ((val_now - val_last_year) / val_last_year) * 100
-                    display_val = f"{yoy:.1f}%"
-                else:
-                    display_val = "Calc Error"
+            if ind['change'] == True:
+                diff = (val - series.iloc[1]) * 1000
+                disp = f"{int(diff):+,}"
+            elif ind['change'] == "yoy":
+                yoy = ((val - series.iloc[12])/series.iloc[12])*100
+                disp = f"{yoy:.1f}%"
             else:
-                display_val = f"{latest_val:.2f}{ind['unit']}"
+                disp = f"{val:.2f}%"
                 
-            data_rows.append({
-                "Event": ind['name'],
-                "Release Date": latest_date.strftime('%Y-%m-%d'),
-                "Latest Actual": display_val,
-                "Source": "FRED Official"
-            })
-            
-        return pd.DataFrame(data_rows)
-    except Exception as e:
+            rows.append({"Event": ind['name'], "Date": date, "Actual": disp, "Source": "FRED Official"})
+        return pd.DataFrame(rows)
+    except:
         return pd.DataFrame()
 
-# --- C. 智能 Fed 语录抓取 (RSS + NLP 关键词匹配) ---
 @st.cache_data(ttl=300)
-def fetch_fed_quotes():
-    """
-    从新闻流中提取包含 Fed 官员名字的句子
-    """
-    # 聚合多个 RSS 源以增加命中率
-    urls = [
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", # CNBC Economy
-        "https://feeds.content.dowjones.io/public/rss/mw_topstories" # MarketWatch
-    ]
-    
-    quotes_found = []
-    
-    for url in urls:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                title = entry.title
-                summary = entry.summary if 'summary' in entry else ""
-                full_text = f"{title} {summary}"
-                
-                # 检查每一个官员的名字是否出现在新闻中
-                for name, info in FED_ROSTER.items():
-                    if name in full_text:
-                        # 简单的去重
-                        if any(q['text'] == title for q in quotes_found): continue
-                        
-                        quotes_found.append({
-                            "name": name,
-                            "role": info['role'],
-                            "stance": info['stance'],
-                            "color": info['color'],
-                            "text": title, # 标题通常就是最好的语录摘要
-                            "date": entry.published if 'published' in entry else "Recent",
-                            "link": entry.link
-                        })
-        except:
-            continue
+def fetch_fed_rss():
+    url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+    try:
+        feed = feedparser.parse(url)
+        return feed.entries[:6]
+    except:
+        return []
+
+# ==========================================
+# 4. 前端 UI 渲染
+# ==========================================
+
+st.title("🏛️ Institutional Dashboard V11 (Hybrid)")
+st.caption(f"System: Live Production | Time: {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+# --- 1. Real-Time Market ---
+st.markdown("### 1. Real-Time Market Overview")
+prices = fetch_live_prices()
+m_cols = st.columns(4)
+if prices:
+    for i, p in enumerate(prices):
+        with m_cols[i]:
+            color = "pos" if p['pct']>=0 else "neg"
+            fmt_p = f"${p['price']:,.2f}" if "Gold" in p['name'] else f"{p['price']:.4f}"
+            if "Index" in p['name']: fmt_p = f"{p['price']:.2f}"
             
-    return quotes_found[:5] # 只展示最新的5条
-
-# ==========================================
-# 3. 前端 UI 渲染
-# ==========================================
-
-st.title("🏛️ Institutional Dashboard V10")
-st.caption(f"Status: Live Production | Last Check: {datetime.datetime.now().strftime('%H:%M:%S')}")
-
-# --- 1. Smart Money (Fixed: Requests + Headers) ---
-st.markdown("### 1. Smart Money Positioning (CFTC Official)")
-st.caption("Data Source: cftc.gov Legacy Report (Live Fetch). Showing Net Positions (Long - Short) for Managed Money.")
-
-cot_data = fetch_cftc_robust()
-
-if cot_data:
-    c1, c2, c3 = st.columns(3)
-    # 动态分配
-    for item in cot_data:
-        target_col = None
-        if "EURO" in item['asset']: target_col = c1
-        elif "GBP" in item['asset']: target_col = c2
-        elif "GOLD" in item['asset']: target_col = c3
-        
-        if target_col:
-            with target_col:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <div class="metric-label">{item['asset'].split('-')[0].strip()} Futures</div>
-                    <div class="metric-val">{int(item['net']):,}</div>
-                    <div class="metric-sub">
-                        📅 Report Date: {item['date']}
-                    </div>
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">{p['name']}</div>
+                <div class="metric-val {color}">{fmt_p}</div>
+                <div class="metric-sub">
+                    <span class="{color}">{p['pct']:+.2f}%</span>
+                    <span>Live</span>
                 </div>
-                """, unsafe_allow_html=True)
-else:
-    st.error("⚠️ Connection to CFTC.gov timed out. The government server might be slow. Please refresh.")
+            </div>
+            """, unsafe_allow_html=True)
 
 st.markdown("---")
 
-# --- 2. Macro Data (Fixed: Dates & Forecast Removed) ---
-st.markdown("### 2. Macroeconomic Matrix (FRED Official)")
-st.caption("Data Source: St. Louis Fed. Dates shown are the **latest official release dates**. Note: CPI/NFP data naturally lags by 1 month.")
+# --- 2. Smart Money (Hybrid Engine) ---
+st.markdown("### 2. Smart Money Positioning (COT)")
+st.caption("Engine: Hybrid. Tries to fetch Real CFTC data first; auto-switches to Simulation if government server blocks connection.")
 
-macro_df = fetch_fred_latest()
+cot_data = hybrid_engine.get_cot_data()
+
+if cot_data:
+    c1, c2, c3 = st.columns(3)
+    for item in cot_data:
+        target = c1 if "EURO" in item['asset'] else c2 if "GBP" in item['asset'] else c3
+        
+        # 状态指示器
+        if item['source_type'] == "REAL":
+            status_html = '<span class="status-real">✅ Real Data (CFTC.gov)</span>'
+        else:
+            status_html = '<span class="status-sim">⚠️ Simulated (Mock)</span>'
+            
+        with target:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">{item['asset']} Futures</div>
+                <div class="metric-val">{int(item['net']):,}</div>
+                <div class="metric-sub">
+                    <span>Date: {item['date']}</span>
+                    {status_html}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+st.markdown("---")
+
+# --- 3. Macro Matrix (FRED) ---
+st.markdown("### 3. Macroeconomic Matrix (Official)")
+macro_df = fetch_fred_official()
 
 if not macro_df.empty:
     st.dataframe(
         macro_df,
         use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Event": st.column_config.TextColumn("Indicator", width="medium"),
-            "Release Date": st.column_config.DateColumn("Release Date", format="YYYY-MM-DD"),
-            "Latest Actual": st.column_config.TextColumn("Actual Value", help="Official government figure"),
-        }
+        hide_index=True
     )
 else:
-    st.warning("FRED API Limit Reached or Key Invalid. Please check logs.")
+    st.warning("FRED Data unavailable (Check API Key).")
 
 st.markdown("---")
 
-# --- 3. Fed Radar (Fixed: Quotes & Stance) ---
-st.markdown("### 3. 🦅 Fed Speaker Radar (Live Quotes)")
-st.caption("Scraping live news for quotes from key FOMC members. Stance (Hawk/Dove) is auto-tagged.")
+# --- 4. Fed Radar (RSS) ---
+st.markdown("### 4. 🦅 Fed & Economic Radar (RSS)")
+news = fetch_fed_rss()
+n_cols = st.columns(2)
 
-quotes = fetch_fed_quotes()
-
-if quotes:
-    for q in quotes:
-        st.markdown(f"""
-        <div class="fed-quote-card" style="border-left-color: {q['color']};">
-            <div>
-                <span class="speaker-name">{q['name']}</span>
-                <span class="speaker-role">| {q['role']}</span>
-                <span class="stance-tag" style="color:{q['color']}; border-color:{q['color']}">{q['stance']}</span>
-            </div>
-            <div class="quote-text">“{q['text']}”</div>
-            <div style="text-align:right; font-size:11px; margin-top:5px;">
-                <a href="{q['link']}" target="_blank" style="color:#58a6ff; text-decoration:none;">Read Source 🔗</a> | {q['date']}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+if news:
+    # Split news into two columns
+    mid = len(news)//2
+    left_news = news[:mid]
+    right_news = news[mid:]
+    
+    with n_cols[0]:
+        for n in left_news:
+            st.markdown(f'<div class="fed-card"><a href="{n.link}" target="_blank" class="news-link">{n.title}</a><div class="news-meta">{n.published}</div></div>', unsafe_allow_html=True)
+    with n_cols[1]:
+        for n in right_news:
+            st.markdown(f'<div class="fed-card"><a href="{n.link}" target="_blank" class="news-link">{n.title}</a><div class="news-meta">{n.published}</div></div>', unsafe_allow_html=True)
 else:
-    st.info("No direct quotes from Fed members found in the last few hours. Displaying Roster Reference below:")
-    # Fallback: 展示一下静态的立场表，以防没有新闻
-    st.markdown("#### FOMC Stance Reference (No live news)")
-    cols = st.columns(4)
-    for i, (name, info) in enumerate(FED_ROSTER.items()):
-        with cols[i % 4]:
-            st.markdown(f"**{name}**: <span style='color:{info['color']}'>{info['stance']}</span>", unsafe_allow_html=True)
-
-st.markdown("---")
-st.markdown("#### ℹ️ Data Note")
-st.caption("""
-1. **CFTC Data**: Fetched using browser-headers to bypass 403 blocks.
-2. **FRED Data**: Shows 'Latest Actual' only. Forecasts are proprietary and removed to avoid confusion.
-3. **Fed Radar**: Scans CNBC/MarketWatch RSS for member names and displays the headline as context.
-""")
+    st.info("No news feed currently available.")
