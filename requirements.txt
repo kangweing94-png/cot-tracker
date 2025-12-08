@@ -1,7 +1,6 @@
 streamlit
 pandas
-numpy
 plotly
 yfinance
 feedparser
-pandas_datareader
+fredapi
