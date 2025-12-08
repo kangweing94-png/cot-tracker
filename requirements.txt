@@ -1,8 +1,8 @@
 streamlit
 pandas
+numpy
 plotly
 yfinance
 feedparser
 fredapi
 requests
-beautifulsoup4
